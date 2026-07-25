@@ -228,7 +228,7 @@ data:
     pxe-service=tag:!ipxe,tag:efi64,x86-64_EFI,"chain to iPXE (UEFI)",ipxe.efi
 
     # Stage 2 — iPXE asks again; hand it the HTTP script
-    dhcp-boot=tag:ipxe,http://192.168.1.10:8080/boot.ipxe
+    dhcp-boot=tag:ipxe,http://192.168.1.210:8080/boot.ipxe
 
     enable-tftp
     tftp-root=/var/lib/tftpboot
@@ -280,9 +280,10 @@ data:
         # Allowlist the three workers, log every request, deny everything else.
         location /config/ {
           alias /srv/config/;
-          allow 192.168.1.21;
-          allow 192.168.1.22;
-          allow 192.168.1.23;
+          allow 192.168.1.211;
+          allow 192.168.1.212;
+          allow 192.168.1.213;
+          allow 192.168.1.214;
           deny  all;
           default_type text/yaml;
           access_log /dev/stdout;
@@ -402,7 +403,7 @@ spec:
             - name: DEST
               value: "/assets"
             - name: BASE_URL
-              value: "http://192.168.1.10:8080"
+              value: "http://192.168.1.210:8080"
           volumeMounts:
             - name: scripts
               mountPath: /scripts
@@ -600,7 +601,7 @@ talosctl gen secrets -o secrets.yaml
 **A5.** Generate the machine configs with both patches applied in one shot:
 
 ```bash
-talosctl gen config homelab https://192.168.1.10:6443 \
+talosctl gen config homelab https://192.168.1.210:6443 \
   --with-secrets secrets.yaml \
   --config-patch-control-plane @patches/controlplane.yaml \
   --config-patch-worker @patches/worker.yaml \
@@ -631,20 +632,20 @@ Write it to USB (`dd`, Rufus, balenaEtcher — whatever you like).
 
 ### Phase B — NUC: install Talos and bootstrap the cluster
 
-**B1.** Boot the NUC from the USB stick. It comes up in **maintenance mode** and displays its DHCP address on the console dashboard. It should match your reservation (`192.168.1.10`).
+**B1.** Boot the NUC from the USB stick. It comes up in **maintenance mode** and displays its DHCP address on the console dashboard. It should match your reservation (`192.168.1.210`).
 
 **B2.** Point talosctl at it:
 
 ```bash
 export TALOSCONFIG=$PWD/talosconfig
-talosctl config endpoint 192.168.1.10
-talosctl config node 192.168.1.10
+talosctl config endpoint 192.168.1.210
+talosctl config node 192.168.1.210
 ```
 
 **B3.** **Confirm the install disk** before applying anything:
 
 ```bash
-talosctl -n 192.168.1.10 get disks --insecure
+talosctl -n 192.168.1.210 get disks --insecure
 ```
 
 If the NVMe is not `/dev/nvme0n1`, fix `patches/controlplane.yaml` and re-run **A5**.
@@ -652,32 +653,32 @@ If the NVMe is not `/dev/nvme0n1`, fix `patches/controlplane.yaml` and re-run **
 **B4.** Apply the control-plane config. The node installs to NVMe and reboots.
 
 ```bash
-talosctl apply-config --insecure -n 192.168.1.10 -f controlplane.yaml
+talosctl apply-config --insecure -n 192.168.1.210 -f controlplane.yaml
 ```
 
 **B5.** Wait for it to come back (2–5 minutes), then bootstrap etcd. **Run this exactly once, ever.**
 
 ```bash
-talosctl -n 192.168.1.10 bootstrap
+talosctl -n 192.168.1.210 bootstrap
 ```
 
 **B6.** Fetch kubeconfig and confirm the node is up:
 
 ```bash
-talosctl -n 192.168.1.10 kubeconfig ./kubeconfig
+talosctl -n 192.168.1.210 kubeconfig ./kubeconfig
 export KUBECONFIG=$PWD/kubeconfig
-kubectl get nodes -o wide     # cp-01 Ready (may take a few minutes)
+kubectl get nodes -o wide     # cp-00 Ready (may take a few minutes)
 ```
 
 **B7.** **Discover the NUC's interface name** — you need it for dnsmasq:
 
 ```bash
-talosctl -n 192.168.1.10 get links -o json | grep -i '"id"' | head -20
+talosctl -n 192.168.1.210 get links -o json | grep -i '"id"' | head -20
 # or, more readable:
-talosctl -n 192.168.1.10 get addresses
+talosctl -n 192.168.1.210 get addresses
 ```
 
-Look for the physical link carrying `192.168.1.10` — typically `enp0s31f6` on a NUC10. Record it.
+Look for the physical link carrying `192.168.1.210` — typically `enp0s31f6` on a NUC10. Record it.
 
 ---
 
@@ -741,14 +742,14 @@ kubectl -n netboot rollout status deploy/nginx
 
 ```bash
 # iPXE script is served
-curl -s http://192.168.1.10:8080/boot.ipxe
+curl -s http://192.168.1.210:8080/boot.ipxe
 
 # kernel and initramfs are present and non-trivial in size
-curl -sI http://192.168.1.10:8080/assets/vmlinuz-amd64      | head -3
-curl -sI http://192.168.1.10:8080/assets/initramfs-amd64.xz | head -3
+curl -sI http://192.168.1.210:8080/assets/vmlinuz-amd64      | head -3
+curl -sI http://192.168.1.210:8080/assets/initramfs-amd64.xz | head -3
 
 # config server correctly REFUSES your workstation (expect 403)
-curl -s -o /dev/null -w '%{http_code}\n' http://192.168.1.10:8080/config/worker.yaml
+curl -s -o /dev/null -w '%{http_code}\n' http://192.168.1.210:8080/config/worker.yaml
 ```
 
 A `403` on that last command means the allowlist works. A `200` means your workstation is inside the allowlist — check the IPs in `nginx.conf`.
@@ -785,15 +786,15 @@ Repeat D1–D6 for all three units.
 
 Do **one node only**, and watch it. If it works, the other two are copy-paste.
 
-**E1.** Power on `w-01`. On the dnsmasq log tail from C8 you should see, in order:
+**E1.** Power on `wn-01`. On the dnsmasq log tail from C8 you should see, in order:
 
 ```
 DHCPDISCOVER(enp0s31f6) aa:bb:cc:dd:ee:01
 PXE(enp0s31f6) aa:bb:cc:dd:ee:01 proxy
 ...  undionly.kpxe
-sent /var/lib/tftpboot/undionly.kpxe to 192.168.1.21
+sent /var/lib/tftpboot/undionly.kpxe to 192.168.1.211
 DHCPDISCOVER(enp0s31f6) aa:bb:cc:dd:ee:01          <- now from iPXE
-... http://192.168.1.10:8080/boot.ipxe
+... http://192.168.1.210:8080/boot.ipxe
 ```
 
 **E2.** Then in the nginx log:
@@ -802,7 +803,7 @@ DHCPDISCOVER(enp0s31f6) aa:bb:cc:dd:ee:01          <- now from iPXE
 kubectl -n netboot logs -f deploy/nginx
 ```
 
-Expect `GET /boot.ipxe`, `GET /assets/vmlinuz-amd64`, `GET /assets/initramfs-amd64.xz`, `GET /config/worker.yaml` — all `200`, all from `192.168.1.21`.
+Expect `GET /boot.ipxe`, `GET /assets/vmlinuz-amd64`, `GET /assets/initramfs-amd64.xz`, `GET /config/worker.yaml` — all `200`, all from `192.168.1.211`.
 
 **E3.** Watch it join:
 
@@ -810,20 +811,20 @@ Expect `GET /boot.ipxe`, `GET /assets/vmlinuz-amd64`, `GET /assets/initramfs-amd
 kubectl get nodes -w
 ```
 
-`w-01` should appear and reach `Ready` within a few minutes of the config fetch.
+`wn-01` should appear and reach `Ready` within a few minutes of the config fetch.
 
 **E4.** Confirm what actually got provisioned on the mSATA:
 
 ```bash
-talosctl -n 192.168.1.21 get volumestatus
-talosctl -n 192.168.1.21 dmesg | tail -50
+talosctl -n 192.168.1.210 get volumestatus
+talosctl -n 192.168.1.210 dmesg | tail -50
 ```
 
 **E5.** **The critical test — reboot it and confirm it netboots again**, rather than booting from disk:
 
 ```bash
 kubectl -n netboot logs -f deploy/nginx &     # keep watching
-talosctl -n 192.168.1.21 reboot
+talosctl -n 192.168.1.210 reboot
 ```
 
 A fresh `GET /config/worker.yaml` in the nginx log means netboot-every-boot is working. **No fetch means the node booted from disk** — see §7.1.
@@ -832,16 +833,16 @@ A fresh `GET /config/worker.yaml` in the nginx log means netboot-every-boot is w
 
 ### Phase F — Remaining workers
 
-**F1.** Power on `w-02` and `w-03`. No per-node configuration required — same `worker.yaml`, hostnames from DHCP reservations.
+**F1.** Power on `wn-02`, `wn-03` and `wn-04`. No per-node configuration required — same `worker.yaml`, hostnames from DHCP reservations.
 
 **F2.** Final state check:
 
 ```bash
 kubectl get nodes -o wide
-talosctl -n 192.168.1.10 health --wait-timeout 10m
+talosctl -n 192.168.1.210 health --wait-timeout 10m
 ```
 
-Expect four nodes `Ready`: `cp-01` (control-plane) and `w-01/02/03`.
+Expect four nodes `Ready`: `cp-00` (control-plane) and `wn-01/02/03/04`.
 
 **F3.** Commit the repo — **without** the files listed in §4.11.
 
@@ -861,17 +862,17 @@ Store `secrets.yaml` and `talosconfig` in a password manager. They are not regen
 kubectl get nodes -o wide
 
 # Talos-level health
-talosctl -n 192.168.1.10 health --wait-timeout 10m
+talosctl -n 192.168.1.210 health --wait-timeout 10m
 
 # workers have the expected label and no install section took effect
 kubectl get nodes -l hardware=fw2b
-talosctl -n 192.168.1.21,192.168.1.22,192.168.1.23 get volumestatus
+talosctl -n 192.168.1.211,192.168.1.212,192.168.1.213,192.168.1.214 get volumestatus
 
 # netboot stack running on the control plane only
 kubectl -n netboot get pods -o wide
 
 # config server still refuses non-workers
-curl -s -o /dev/null -w '%{http_code}\n' http://192.168.1.10:8080/config/worker.yaml   # 403
+curl -s -o /dev/null -w '%{http_code}\n' http://192.168.1.210:8080/config/worker.yaml   # 403
 
 # schedule something and confirm it lands
 kubectl create deployment nginx-test --image=nginx:alpine --replicas=3
@@ -909,14 +910,14 @@ Symptom: after a reboot, nginx logs no `/config/worker.yaml` fetch, but the node
 2. Confirm the mSATA is not in the BIOS boot order (step **D4**).
 3. Wipe and let it rebuild:
    ```bash
-   talosctl -n 192.168.1.21 reset --graceful=false --reboot \
+   talosctl -n 192.168.1.210 reset --graceful=false --reboot \
      --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL
    ```
 4. If it keeps installing, accept the fallback: add `machine.install: {disk: /dev/sda}` to `patches/worker.yaml`, regenerate (**A5**), update the Secret (**C4**), and set the BIOS boot order to disk-first / network-fallback. You lose netboot-every-boot; you keep everything else.
 
 ### 7.2 Testing whether true zero-disk works
 
-Curiosity satisfied cheaply: pull the mSATA out of `w-03` and boot it. If it joins and reaches `Ready`, your Talos build tolerates a diskless worker. If it hangs in maintenance mode, you've confirmed the STATE requirement from §2 and the current design is the right one.
+Curiosity satisfied cheaply: pull the mSATA out of `wn-03` and boot it. If it joins and reaches `Ready`, your Talos build tolerates a diskless worker. If it hangs in maintenance mode, you've confirmed the STATE requirement from §2 and the current design is the right one.
 
 ---
 
@@ -934,7 +935,7 @@ kubectl apply -f k8s/20-job-fetch-assets.yaml
 kubectl -n netboot wait --for=condition=complete job/fetch-assets --timeout=300s
 
 # 3. roll the workers one at a time
-for ip in 192.168.1.21 192.168.1.22 192.168.1.23; do
+for ip in 192.168.1.211 192.168.1.212 192.168.1.213 192.168.1.214; do
   kubectl drain "$(kubectl get node -o name | grep "${ip##*.}")" --ignore-daemonsets --delete-emptydir-data || true
   talosctl -n "$ip" reboot
   sleep 120
@@ -947,7 +948,7 @@ This is the payoff of netboot-every-boot: no per-node upgrade orchestration, no 
 ### 8.2 Upgrading the control plane — normal Talos upgrade
 
 ```bash
-talosctl -n 192.168.1.10 upgrade \
+talosctl -n 192.168.1.210 upgrade \
   --image factory.talos.dev/installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:v1.13.7
 ```
 
@@ -956,7 +957,7 @@ The installer schematic **must match** the schematic used for the boot assets.
 ### 8.3 Backups — do this before you need it
 
 ```bash
-talosctl -n 192.168.1.10 etcd snapshot etcd-$(date +%F).db
+talosctl -n 192.168.1.210 etcd snapshot etcd-$(date +%F).db
 ```
 
 Single control plane means no quorum to save you. The three things that make a rebuild a 30-minute job instead of starting over:
@@ -970,7 +971,7 @@ Schedule the snapshot. Store all three off the cluster.
 ### 8.4 Rebuilding a worker from scratch
 
 ```bash
-talosctl -n 192.168.1.22 reset --graceful=false --reboot \
+talosctl -n 192.168.1.212 reset --graceful=false --reboot \
   --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL
 ```
 
