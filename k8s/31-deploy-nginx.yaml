@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: netboot
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: nginx
+          image: docker.io/library/nginx:1.27-alpine
+          ports:
+            - containerPort: 8080
+              hostPort: 8080
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: assets
+              mountPath: /srv/assets
+              readOnly: true
+            - name: config
+              mountPath: /srv/config
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /boot.ipxe
+              port: 8080
+            initialDelaySeconds: 3
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: nginx-config
+        - name: assets
+          hostPath:
+            path: /var/lib/netboot/assets
+            type: DirectoryOrCreate
+        - name: config
+          secret:
+            secretName: machine-config
+            defaultMode: 0444

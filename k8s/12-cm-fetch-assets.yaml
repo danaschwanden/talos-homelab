@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fetch-assets-script
+  namespace: netboot
+data:
+  fetch-assets.sh: |
+    #!/bin/sh
+    set -eu
+
+    echo "Talos ${TALOS_VERSION}, schematic ${SCHEMATIC}"
+
+    PXE_SCRIPT="$(curl -fsSL --retry 3 \
+      "https://pxe.factory.talos.dev/pxe/${SCHEMATIC}/${TALOS_VERSION}/metal-amd64")"
+
+    echo "--- Image Factory iPXE script ---"
+    printf '%s\n' "$PXE_SCRIPT"
+    echo "---------------------------------"
+
+    KERNEL_LINE="$(printf '%s\n' "$PXE_SCRIPT" | grep '^kernel ' || true)"
+    INITRD_LINE="$(printf '%s\n' "$PXE_SCRIPT" | grep '^initrd ' || true)"
+
+    [ -n "$KERNEL_LINE" ] || { echo "FATAL: no kernel line in PXE script"; exit 1; }
+    [ -n "$INITRD_LINE" ] || { echo "FATAL: no initrd line in PXE script"; exit 1; }
+
+    KERNEL_URL="$(printf  '%s\n' "$KERNEL_LINE" | awk '{print $2}')"
+    INITRD_URL="$(printf  '%s\n' "$INITRD_LINE" | awk '{print $2}')"
+    KERNEL_ARGS="$(printf '%s\n' "$KERNEL_LINE" | cut -d' ' -f3-)"
+
+    mkdir -p "$DEST"
+
+    # download to .tmp then rename, so a failed fetch can't brick netboot
+    curl -fsSL --retry 3 -o "${DEST}/vmlinuz-amd64.tmp"      "$KERNEL_URL"
+    curl -fsSL --retry 3 -o "${DEST}/initramfs-amd64.xz.tmp" "$INITRD_URL"
+    mv "${DEST}/vmlinuz-amd64.tmp"      "${DEST}/vmlinuz-amd64"
+    mv "${DEST}/initramfs-amd64.xz.tmp" "${DEST}/initramfs-amd64.xz"
+
+    # Generate boot.ipxe using Image Factory's own kernel args, plus ours.
+    # \${base} is escaped so the shell leaves it for iPXE to expand.
+    cat > "${DEST}/boot.ipxe" <<EOF
+    #!ipxe
+    :retry
+    dhcp || goto retry
+    set base ${BASE_URL}
+    kernel \${base}/assets/vmlinuz-amd64 ${KERNEL_ARGS} console=ttyS0,115200n8 talos.config=\${base}/config/worker.yaml || goto retry
+    initrd \${base}/assets/initramfs-amd64.xz || goto retry
+    boot || goto retry
+    EOF
+
+    echo "--- generated boot.ipxe ---"
+    cat "${DEST}/boot.ipxe"
+    echo "---------------------------"
+    ls -l "$DEST"
+    echo "assets ready"

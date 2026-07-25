@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dnsmasq-config
+  namespace: netboot
+data:
+  dnsmasq.conf: |
+    # DNS off — this instance does DHCP/TFTP only
+    port=0
+    log-dhcp
+    interface=ENP_PLACEHOLDER
+    bind-interfaces
+
+    # Proxy mode: answer PXE options only, never hand out an address.
+    # The router remains the DHCP server.
+    dhcp-range=192.168.1.0,proxy
+    dhcp-no-override
+
+    # Client architecture tagging
+    dhcp-match=set:bios,option:client-arch,0
+    dhcp-match=set:efi64,option:client-arch,7
+    dhcp-match=set:efi64,option:client-arch,9
+
+    # Detect a request that came from iPXE itself (two ways, same tag)
+    dhcp-match=set:ipxe,175
+    dhcp-userclass=set:ipxe,iPXE
+
+    # Stage 1 — firmware option ROM chainloads iPXE over TFTP.
+    # tag:!ipxe is what prevents an infinite chainload loop.
+    pxe-service=tag:!ipxe,tag:bios,x86PC,"chain to iPXE (BIOS)",undionly.kpxe
+    pxe-service=tag:!ipxe,tag:efi64,x86-64_EFI,"chain to iPXE (UEFI)",ipxe.efi
+
+    # Stage 2 — iPXE asks again; hand it the HTTP script
+    dhcp-boot=tag:ipxe,http://192.168.1.210:8080/boot.ipxe
+
+    enable-tftp
+    tftp-root=/var/lib/tftpboot
