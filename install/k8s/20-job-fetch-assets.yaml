@@ -27,7 +27,7 @@ spec:
             - name: TALOS_VERSION
               value: "v1.13.6"
             - name: SCHEMATIC
-              value: "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
+              value: "2d61dd07b20062062ea671b4d01873506103b67c0f7a4c3fb6cf4ee85585dcb8"
             - name: DEST
               value: "/assets"
             - name: BASE_URL

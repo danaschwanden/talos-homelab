@@ -1,5 +1,7 @@
 .DS_Store
+controlplane.yaml
 secrets.yaml
+worker.yaml
 talosconfig
 kubeconfig
 metal-amd64.iso

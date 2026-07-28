@@ -8,30 +8,31 @@ data:
     # DNS off — this instance does DHCP/TFTP only
     port=0
     log-dhcp
-    interface=ENP_PLACEHOLDER
-    bind-interfaces
+    interface=eno1
+    bind-dynamic
 
-    # Proxy mode: answer PXE options only, never hand out an address.
-    # The router remains the DHCP server.
+    # Disable broadcast+multicast discovery, download boot file immediately
+    dhcp-option=vendor:PXEClient,6,2b
+
     dhcp-range=10.0.2.0,proxy
     dhcp-no-override
 
-    # Client architecture tagging
-    dhcp-match=set:bios,option:client-arch,0
-    dhcp-match=set:efi64,option:client-arch,7
-    dhcp-match=set:efi64,option:client-arch,9
+    # iPXE feature detection via option 175 suboptions
+    dhcp-match=set:ipxe-http,175,19
+    dhcp-match=set:ipxe-menu,175,39
+    dhcp-match=set:ipxe-iscsi,175,17
+    dhcp-match=set:ipxe-pxe,175,33
+    dhcp-match=set:ipxe-bzimage,175,24
+    dhcp-match=set:ipxe-efi,175,36
+    tag-if=set:ipxe-ok,tag:ipxe-http,tag:ipxe-menu,tag:ipxe-iscsi,tag:ipxe-pxe,tag:ipxe-bzimage
+    tag-if=set:ipxe-ok,tag:ipxe-http,tag:ipxe-menu,tag:ipxe-iscsi,tag:ipxe-efi
 
-    # Detect a request that came from iPXE itself (two ways, same tag)
-    dhcp-match=set:ipxe,175
-    dhcp-userclass=set:ipxe,iPXE
+    # Stage 1 — chainload iPXE. Also generates the option 43 cruft proxy mode requires.
+    pxe-service=tag:!ipxe-ok,X86PC,PXE,undionly.kpxe,10.0.2.150
+    pxe-service=tag:!ipxe-ok,X86-64_EFI,PXE,ipxe.efi,10.0.2.150
 
-    # Stage 1 — firmware option ROM chainloads iPXE over TFTP.
-    # tag:!ipxe is what prevents an infinite chainload loop.
-    pxe-service=tag:!ipxe,tag:bios,x86PC,"chain to iPXE (BIOS)",undionly.kpxe
-    pxe-service=tag:!ipxe,tag:efi64,x86-64_EFI,"chain to iPXE (UEFI)",ipxe.efi
-
-    # Stage 2 — iPXE asks again; hand it the HTTP script
-    dhcp-boot=tag:ipxe,http://10.0.2.150:8080/boot.ipxe
+    # Stage 2 — must stay last; server address non-zero
+    dhcp-boot=tag:ipxe-ok,http://10.0.2.150:8080/boot.ipxe,,0.0.0.1
 
     enable-tftp
     tftp-root=/var/lib/tftpboot

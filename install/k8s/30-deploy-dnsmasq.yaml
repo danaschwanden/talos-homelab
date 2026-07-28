@@ -25,7 +25,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: dnsmasq
-          image: quay.io/poseidon/dnsmasq:latest
+          image: quay.io/poseidon/dnsmasq:v0.5.0-51-gc8a9de4
           args:
             - "-d"                                    # foreground
             - "-q"                                    # log queries
