@@ -1,0 +1,8 @@
+---
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+mirrors:
+  10.0.2.160:5000:
+    endpoints:
+      - url: http://10.0.2.160:5000
+        overridePath: true

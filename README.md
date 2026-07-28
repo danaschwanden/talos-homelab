@@ -1,4 +1,4 @@
-# Talos - Cluster Build Runbook
+# Talos cluster build runbook
 ### NUC10FNH control plane + 4× Protectli FW2B netbooted workers
 
 **Audience:** whoever implements this. Follow §5 top to bottom. Every file you need is in §4 in full; every command is in §5 in execution order.
@@ -17,6 +17,8 @@
 | **DHCP** | your existing router keeps serving leases; the NUC only adds PXE options |
 | **Worker state** | mSATA holds STATE + EPHEMERAL only — no bootloader, no install |
 | **Config server security** | source-IP allowlist + access logging on `/config/` |
+| **Agent Substrate** (§10) | control plane + Valkey on the NUC; WorkerPool pinned to FW2Bs only |
+| **Snapshot store** (§10) | RustFS on the DGX Spark, reached over S3 |
 
 **Not HA.** One control plane means no etcd quorum. If the NUC is down, the Kubernetes API is down and no worker can boot. That is an accepted tradeoff of this design, not an oversight — see §8.
 
@@ -28,11 +30,19 @@
 - **Intel Celeron J3060: 2 cores, 2 threads**, 1.6 GHz / 2.48 GHz turbo. (The quad-core J3160 is the FW4B — do not assume 4 cores.)
 - **8 GB DDR3L maximum**, single SO-DIMM. Fit 8 GB in each.
 - 1× mSATA + an internal SATA header. 2× Intel i211 1GbE. 2× HDMI. RJ45 serial console at **115200 8N1**.
-- Ships with **AMI BIOS or coreboot**. The FW-series coreboot build is **legacy BIOS only with no setup menu** (F11 for a boot menu is all you get). **Use AMI BIOS.** If these units are on coreboot, flash AMI before starting.
+- Ships with **AMI BIOS or coreboot**. **Both can netboot — you do not need to reflash.** Protectli's coreboot build is legacy-BIOS-only (SeaBIOS payload, no setup menu, `F11` for a boot menu) but **includes an iPXE ROM**, which is actually the better path here: iPXE runs straight from flash, so the TFTP chainload stage is skipped entirely. See Phase D for both variants.
 - x86-64-v2 is satisfied (Airmont has SSE4.2, POPCNT, CX16), so Talos runs. No blocker.
 
 ### Intel NUC10FNH
 - Comet Lake, single Intel i219-V NIC, M.2 NVMe + 2.5" SATA bay. Plenty for a control plane.
+
+### ⚠️ This cluster is CPU-heterogeneous — it constrains §10
+
+The NUC is Comet Lake (AVX, AVX2, BMI). The FW2Bs are Airmont — **SSE4.2 and nothing above it, no AVX at all.** That is close to the widest CPU feature gap two x86 machines can have.
+
+It doesn't matter for plain Kubernetes. It matters enormously for Agent Substrate, because gVisor checkpoint images capture CPU feature state and **a snapshot taken on a machine with more features will not restore on one with fewer** ([google/gvisor#11486](https://github.com/google/gvisor/issues/11486)). A golden snapshot taken on the NUC will fail to restore on a FW2B, intermittently and with confusing errors.
+
+The fix is to keep every Substrate WorkerPool pinned to a single homogeneous node set. §10 does this with `nodeSelector: hardware: fw2b`, which is why the `hardware: fw2b` node label in §4.3 is load-bearing and not cosmetic. **Never add the NUC to a WorkerPool, and re-baseline every ActorTemplate if you ever add a node of a different vintage.**
 
 ### The "diskless" caveat
 
@@ -52,14 +62,27 @@ If netboot-every-boot turns out to be flaky in your environment, the fallback is
 |---|---|---|
 | Worker MAC addresses ×4 | router DHCP reservations | sticker on the unit, or the PXE screen on first boot |
 | NUC MAC address | router DHCP reservation | boot the Talos ISO, read the dashboard |
-| Cluster subnet | everywhere | `192.168.1.0/24` |
-| Router / gateway IP | firewall + reservations | `192.168.1.1` |
-| NUC IP | everywhere | `192.168.1.210` |
-| Worker IPs | nginx allowlist | `192.168.1.211` / `.212` / `.213` / `.214` |
+| Cluster subnet | everywhere | `10.0.2.0/24` |
+| Router / gateway IP | firewall + reservations | `10.0.2.1` |
+| NUC IP | everywhere | `10.0.2.150` |
+| Worker IPs | nginx allowlist | `10.0.2.151` / `.152` / `.153` / `.154` |
 | NUC NVMe device path | `patches/controlplane.yaml` | discovered in step **B3** |
 | NUC network interface name | `dnsmasq.conf` | discovered in step **B7** |
 | Talos version | asset job | `v1.13.6` |
 | Image Factory schematic ID | asset job | `376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba` (vanilla) |
+
+### 3.1a Node inventory
+
+| Hostname | Hardware | IP | Role | Boots from |
+|---|---|---|---|---|
+| `cp-01` | Intel NUC10FNH | `10.0.2.150` | control plane + netboot stack (+ §10 Substrate control plane, Valkey) | NVMe, installed |
+| `wn-01` | Protectli FW2B | `10.0.2.151` | worker | network, every boot |
+| `wn-02` | Protectli FW2B | `10.0.2.152` | worker | network, every boot |
+| `wn-03` | Protectli FW2B | `10.0.2.153` | worker | network, every boot |
+| `wn-04` | Protectli FW2B | `10.0.2.154` | worker | network, every boot |
+| — | NVIDIA DGX Spark | `10.0.2.160` | §10 only: RustFS + image registry. **Not a cluster node.** | its own disk |
+
+Gateway / router: `10.0.2.1`. Subnet: `10.0.2.0/24`.
 
 ### 3.2 Placeholders used in §4
 
@@ -67,22 +90,23 @@ Every file in §4 uses these literal values. If your network differs, change the
 
 ```bash
 # run from the repo root created in step A2, after writing all files
-grep -rl '192\.168\.1\.' . | xargs sed -i '' 's/192\.168\.1\./10.0.5./g'   # macOS
-# grep -rl '192\.168\.1\.' . | xargs sed -i  's/192\.168\.1\./10.0.5./g'   # Linux
+grep -rl '10\.0\.2\.' . | xargs sed -i '' 's/10\.0\.2\./192.168.7./g'   # macOS
+# grep -rl '10\.0\.2\.' . | xargs sed -i  's/10\.0\.2\./192.168.7./g'   # Linux
 ```
 
 | Placeholder | Value in §4 | Also appears in |
 |---|---|---|
-| Cluster subnet | `192.168.1.0/24` | `dnsmasq.conf` |
-| NUC | `192.168.1.210` | `dnsmasq.conf`, `boot.ipxe`, `talosconfig` endpoint |
-| Workers | `192.168.1.211-214` | `nginx.conf` allowlist |
+| Cluster subnet | `10.0.2.0/24` | `dnsmasq.conf` |
+| NUC | `10.0.2.150` | `dnsmasq.conf`, `boot.ipxe`, `talosconfig` endpoint |
+| Workers | `10.0.2.151`–`10.0.2.154` | `nginx.conf` allowlist |
 | NUC interface | `ENP_PLACEHOLDER` | `dnsmasq.conf` — replaced in step **C1** |
 | NUC install disk | `/dev/nvme0n1` | `patches/controlplane.yaml` — verified in step **B3** |
+| DGX Spark | `10.0.2.160` | §10 only — RustFS, registry |
 
 ### 3.3 Router preparation — do this before anything else
 
 1. Create **DHCP reservations** for all four MACs at the IPs above.
-2. Set the **hostname** in each reservation: `cp-00`, `wn-01`, `wn-02`, `wn-03`, `wn-04`. Talos picks up the DHCP-supplied hostname (option 12), which is why no hostname appears in any machine config below and why all three workers can share one config file.
+2. Set the **hostname** in each reservation: `cp-01`, `wn-01`, `wn-02`, `wn-03`, `wn-04`. Talos picks up the DHCP-supplied hostname (option 12), which is why no hostname appears in any machine config below and why all four workers can share one config file.
 3. **Verify the router is NOT sending PXE options.** Check that DHCP options 66 (`next-server`) and 67 (`filename`) are unset. Two DHCP servers offering boot files produces intermittent, maddening failures.
 
 ### 3.4 Workstation tooling
@@ -107,15 +131,22 @@ talos-homelab/
 ├── schematic.yaml
 ├── patches/
 │   ├── controlplane.yaml
-│   └── worker.yaml
-└── k8s/
-    ├── 00-namespace.yaml
-    ├── 10-cm-dnsmasq.yaml
-    ├── 11-cm-nginx.yaml
-    ├── 12-cm-fetch-assets.yaml
-    ├── 20-job-fetch-assets.yaml
-    ├── 30-deploy-dnsmasq.yaml
-    └── 31-deploy-nginx.yaml
+│   ├── worker.yaml
+│   └── registry-mirror.yaml          # §10 only
+├── k8s/
+│   ├── 00-namespace.yaml
+│   ├── 10-cm-dnsmasq.yaml
+│   ├── 11-cm-nginx.yaml
+│   ├── 12-cm-fetch-assets.yaml
+│   ├── 20-job-fetch-assets.yaml
+│   ├── 30-deploy-dnsmasq.yaml
+│   └── 31-deploy-nginx.yaml
+└── substrate/                        # §10 only
+    ├── sandboxconfig-gvisor-homelab.yaml
+    ├── workerpool-fw2b.yaml
+    ├── ate-demo-counter.yaml
+    └── manifests/ate-install/homelab/
+        └── kustomization.yaml        # copy into your substrate checkout
 ```
 
 `talosctl gen config` will later add `controlplane.yaml`, `worker.yaml`, `secrets.yaml`, and `talosconfig` at the root. **Those four contain secrets — see §4.11 before committing anything to git.**
@@ -145,11 +176,31 @@ If you skip this, use the vanilla schematic ID `376567988ad370138ad8b2698212367b
 machine:
   install:
     disk: /dev/nvme0n1
+  kubelet:
+    extraConfig:
+      featureGates:
+        ClusterTrustBundle: true
+        ClusterTrustBundleProjection: true
+        PodCertificateRequest: true
 cluster:
   allowSchedulingOnControlPlanes: true
+  apiServer:
+    extraArgs:
+      feature-gates: "ClusterTrustBundle=true,ClusterTrustBundleProjection=true,PodCertificateRequest=true"
+      runtime-config: "certificates.k8s.io/v1beta1=true"
+  controllerManager:
+    extraArgs:
+      feature-gates: "ClusterTrustBundle=true,ClusterTrustBundleProjection=true,PodCertificateRequest=true"
+  scheduler:
+    extraArgs:
+      feature-gates: "ClusterTrustBundle=true,ClusterTrustBundleProjection=true,PodCertificateRequest=true"
 ```
 
 `allowSchedulingOnControlPlanes` is **required** — dnsmasq and nginx run on this node, and it removes the `node-role.kubernetes.io/control-plane:NoSchedule` taint.
+
+**The feature gates are for Agent Substrate (§10).** Substrate's `podcertcontroller` depends on `ClusterTrustBundle` and `PodCertificateRequest`, and the install blocks forever waiting on ClusterTrustBundles that will never appear without them. They are **not on by default as of Kubernetes 1.36**, and the `certificates.k8s.io/v1beta1` runtime-config is what actually serves the API. If you are not doing §10, you can drop this whole block — it costs nothing to leave in, but it is not needed for a plain cluster.
+
+> Gates are set on all four components, mirroring what Substrate's own kind config does (which is known to work). If a component crashloops with `unrecognized feature gate`, remove that gate from that component only — the ones that definitely matter are apiserver and kubelet.
 
 ---
 
@@ -158,20 +209,33 @@ cluster:
 ```yaml
 machine:
   nodeLabels:
-    hardware: fw2b
+    hardware: fw2b             # load-bearing — §10 pins WorkerPools to this
   kubelet:
     extraConfig:
+      featureGates:            # §10 (Substrate) — see §4.2
+        ClusterTrustBundle: true
+        ClusterTrustBundleProjection: true
+        PodCertificateRequest: true
       systemReserved:
         memory: 512Mi
       evictionHard:
         memory.available: 250Mi
   sysctls:
     vm.max_map_count: "262144"
+    # --- §10 (Agent Substrate) below this line ---
+    # gVisor requires unprivileged user namespace creation.
+    user.max_user_namespaces: "11255"
+    # gVisor sandbox pod-to-pod networking (actor interior IP 169.254.17.2).
+    net.ipv4.conf.all.proxy_arp: "1"
 ```
 
 **There is deliberately no `machine.install` section.** That is what stops Talos writing a bootloader to the mSATA and hijacking the netboot path on the next reboot.
 
 Note `hardware: fw2b` has no domain prefix on purpose — the NodeRestriction admission plugin blocks a kubelet from self-assigning most `*.kubernetes.io` labels.
+
+> ⚠️ `user.max_user_namespaces` **disables a KSPP hardening default** that Talos sets deliberately — Sidero's own gVisor extension README carries the same warning. Acceptable in a lab; be conscious you're doing it. Both Substrate sysctls are only needed on nodes that run sandboxes, i.e. the workers, not the NUC.
+>
+> `proxy_arp` is lifted from Substrate's own kind setup, where it's required for gVisor pod-to-pod networking. It may be unnecessary with Flannel on real nodes, but it is harmless — set it rather than debug it later.
 
 ---
 
@@ -210,7 +274,7 @@ data:
 
     # Proxy mode: answer PXE options only, never hand out an address.
     # The router remains the DHCP server.
-    dhcp-range=192.168.1.0,proxy
+    dhcp-range=10.0.2.0,proxy
     dhcp-no-override
 
     # Client architecture tagging
@@ -228,7 +292,7 @@ data:
     pxe-service=tag:!ipxe,tag:efi64,x86-64_EFI,"chain to iPXE (UEFI)",ipxe.efi
 
     # Stage 2 — iPXE asks again; hand it the HTTP script
-    dhcp-boot=tag:ipxe,http://192.168.1.210:8080/boot.ipxe
+    dhcp-boot=tag:ipxe,http://10.0.2.150:8080/boot.ipxe
 
     enable-tftp
     tftp-root=/var/lib/tftpboot
@@ -277,13 +341,13 @@ data:
         }
 
         # Machine config contains cluster join tokens.
-        # Allowlist the three workers, log every request, deny everything else.
+        # Allowlist the four workers, log every request, deny everything else.
         location /config/ {
           alias /srv/config/;
-          allow 192.168.1.211;
-          allow 192.168.1.212;
-          allow 192.168.1.213;
-          allow 192.168.1.214;
+          allow 10.0.2.151;
+          allow 10.0.2.152;
+          allow 10.0.2.153;
+          allow 10.0.2.154;
           deny  all;
           default_type text/yaml;
           access_log /dev/stdout;
@@ -403,7 +467,7 @@ spec:
             - name: DEST
               value: "/assets"
             - name: BASE_URL
-              value: "http://192.168.1.210:8080"
+              value: "http://10.0.2.150:8080"
           volumeMounts:
             - name: scripts
               mountPath: /scripts
@@ -601,7 +665,7 @@ talosctl gen secrets -o secrets.yaml
 **A5.** Generate the machine configs with both patches applied in one shot:
 
 ```bash
-talosctl gen config homelab https://192.168.1.210:6443 \
+talosctl gen config homelab https://10.0.2.150:6443 \
   --with-secrets secrets.yaml \
   --config-patch-control-plane @patches/controlplane.yaml \
   --config-patch-worker @patches/worker.yaml \
@@ -632,20 +696,20 @@ Write it to USB (`dd`, Rufus, balenaEtcher — whatever you like).
 
 ### Phase B — NUC: install Talos and bootstrap the cluster
 
-**B1.** Boot the NUC from the USB stick. It comes up in **maintenance mode** and displays its DHCP address on the console dashboard. It should match your reservation (`192.168.1.210`).
+**B1.** Boot the NUC from the USB stick. It comes up in **maintenance mode** and displays its DHCP address on the console dashboard. It should match your reservation (`10.0.2.150`).
 
 **B2.** Point talosctl at it:
 
 ```bash
 export TALOSCONFIG=$PWD/talosconfig
-talosctl config endpoint 192.168.1.210
-talosctl config node 192.168.1.210
+talosctl config endpoint 10.0.2.150
+talosctl config node 10.0.2.150
 ```
 
 **B3.** **Confirm the install disk** before applying anything:
 
 ```bash
-talosctl -n 192.168.1.210 get disks --insecure
+talosctl -n 10.0.2.150 get disks --insecure
 ```
 
 If the NVMe is not `/dev/nvme0n1`, fix `patches/controlplane.yaml` and re-run **A5**.
@@ -653,32 +717,32 @@ If the NVMe is not `/dev/nvme0n1`, fix `patches/controlplane.yaml` and re-run **
 **B4.** Apply the control-plane config. The node installs to NVMe and reboots.
 
 ```bash
-talosctl apply-config --insecure -n 192.168.1.210 -f controlplane.yaml
+talosctl apply-config --insecure -n 10.0.2.150 -f controlplane.yaml
 ```
 
 **B5.** Wait for it to come back (2–5 minutes), then bootstrap etcd. **Run this exactly once, ever.**
 
 ```bash
-talosctl -n 192.168.1.210 bootstrap
+talosctl -n 10.0.2.150 bootstrap
 ```
 
 **B6.** Fetch kubeconfig and confirm the node is up:
 
 ```bash
-talosctl -n 192.168.1.210 kubeconfig ./kubeconfig
+talosctl -n 10.0.2.150 kubeconfig ./kubeconfig
 export KUBECONFIG=$PWD/kubeconfig
-kubectl get nodes -o wide     # cp-00 Ready (may take a few minutes)
+kubectl get nodes -o wide     # cp-01 Ready (may take a few minutes)
 ```
 
 **B7.** **Discover the NUC's interface name** — you need it for dnsmasq:
 
 ```bash
-talosctl -n 192.168.1.210 get links -o json | grep -i '"id"' | head -20
+talosctl -n 10.0.2.150 get links -o json | grep -i '"id"' | head -20
 # or, more readable:
-talosctl -n 192.168.1.210 get addresses
+talosctl -n 10.0.2.150 get addresses
 ```
 
-Look for the physical link carrying `192.168.1.210` — typically `enp0s31f6` on a NUC10. Record it.
+Look for the physical link carrying `10.0.2.150` — typically `enp0s31f6` on a NUC10. Record it.
 
 ---
 
@@ -742,14 +806,14 @@ kubectl -n netboot rollout status deploy/nginx
 
 ```bash
 # iPXE script is served
-curl -s http://192.168.1.210:8080/boot.ipxe
+curl -s http://10.0.2.150:8080/boot.ipxe
 
 # kernel and initramfs are present and non-trivial in size
-curl -sI http://192.168.1.210:8080/assets/vmlinuz-amd64      | head -3
-curl -sI http://192.168.1.210:8080/assets/initramfs-amd64.xz | head -3
+curl -sI http://10.0.2.150:8080/assets/vmlinuz-amd64      | head -3
+curl -sI http://10.0.2.150:8080/assets/initramfs-amd64.xz | head -3
 
 # config server correctly REFUSES your workstation (expect 403)
-curl -s -o /dev/null -w '%{http_code}\n' http://192.168.1.210:8080/config/worker.yaml
+curl -s -o /dev/null -w '%{http_code}\n' http://10.0.2.150:8080/config/worker.yaml
 ```
 
 A `403` on that last command means the allowlist works. A `200` means your workstation is inside the allowlist — check the IPs in `nginx.conf`.
@@ -762,23 +826,57 @@ kubectl -n netboot logs -f deploy/dnsmasq
 
 ---
 
-### Phase D — FW2B firmware (physical access, all three units)
+### Phase D — FW2B firmware (physical access, all four units)
 
-Attach a monitor to HDMI, or a serial console at **115200 8N1** over the RJ45 COM port.
+Attach a monitor to HDMI, or a serial console at **115200 8N1** over the RJ45 COM port. (Both work on either firmware — the coreboot port has serial on the front RJ45 confirmed working upstream.)
 
-**D1.** Power on, press `Delete` repeatedly to enter AMI BIOS setup.
+**First, find out which firmware you have.** Power on and watch the splash. coreboot shows a coreboot/SeaBIOS banner and responds to `F11`; AMI shows a setup prompt and responds to `Delete`.
 
-**D2.** **Advanced → CSM Configuration → Network → Legacy**. This is what makes the i211 ports appear as bootable devices. Without it there is no PXE option at all.
+Then follow **D-core** or **D-ami**, then D5–D7 which are common to both.
 
-**D3.** `F4` → **Save & Exit** → Yes. The unit reboots.
+#### Path D-core — coreboot (no reflash needed)
 
-**D4.** Re-enter setup. In **Boot**, set **network as the first boot device**, and **disable or remove the mSATA boot entry**. Removing the disk entry is belt-and-braces against a stray install taking over the boot path.
+Protectli's coreboot build ships **iPXE integrated as a network-boot ROM**. This is the *simpler* path: iPXE runs directly from flash, so stage 1 of §2's boot chain — TFTP-chainloading `undionly.kpxe` — never happens. iPXE DHCPs, dnsmasq sees the iPXE user-class / option 175 on the very first request, and hands back the HTTP script URL immediately.
+
+**No change to `k8s/10-cm-dnsmasq.yaml` is required.** The `pxe-service` chainload lines simply never fire, and `dhcp-boot=tag:ipxe,...` does all the work. Leave the TFTP config in place — it costs nothing and you'll want it if you ever switch a unit to AMI.
+
+**D-core-1.** Power on, hold `F11` for the boot menu. Confirm a network / iPXE entry is listed. If it is, the firmware can do everything you need.
+
+**D-core-2.** Select the network entry and let it run **once**, manually, with `kubectl -n netboot logs -f deploy/dnsmasq` open. You should see a DHCPDISCOVER already tagged `ipxe`, and then an HTTP fetch of `boot.ipxe` in the nginx log — with no TFTP transfer in between. That confirms the whole path.
+
+**D-core-3 — the one thing you must verify.** Reboot and **do not touch the keyboard.** The unit must reach iPXE and netboot unattended, or the netboot-every-boot design doesn't hold on this firmware.
+
+With no bootloader on the mSATA (which is exactly what §4.3 arranges), SeaBIOS should fall through its boot order and land on the network ROM automatically. If it does, you are done — no reflash, ever.
+
+If it instead drops to a prompt or hangs, pick one of these, cheapest first:
+
+| Fallback | Cost | Notes |
+|---|---|---|
+| **iPXE on a USB stick** | ~5 min/unit, one cheap stick each | Write `ipxe.usb` from <https://boot.ipxe.org/> to a stick, leave it in permanently. SeaBIOS boots USB fine. **Use a rear USB 2.0 port** — upstream coreboot notes USB 3.0 devices are detected very late in SeaBIOS. |
+| **Reflash coreboot with a `bootorder` file** | Build/flash effort | Puts the network BEV first persistently. `flashrom` works internally on these boards. |
+| **Flash AMI BIOS** | Highest | Only if the above fail. Then follow D-ami. |
+
+> One caveat that reads scarier than it is: Protectli's docs note that a URL **typed by hand** into the iPXE shell isn't saved across reboots. That's about interactive use. A URL delivered by DHCP (which is what your dnsmasq does) needs no persistence — it's re-supplied on every boot by design.
+
+#### Path D-ami — AMI BIOS
+
+**D-ami-1.** Power on, press `Delete` repeatedly to enter setup.
+
+**D-ami-2.** **Advanced → CSM Configuration → Network → Legacy**. This is what makes the i211 ports appear as bootable devices. Without it there is no PXE option at all.
+
+**D-ami-3.** `F4` → **Save & Exit** → Yes. The unit reboots.
+
+**D-ami-4.** Re-enter setup. In **Boot**, set **network as the first boot device**, and **disable or remove the mSATA boot entry**. Belt-and-braces against a stray install taking over the boot path.
+
+On this path the full two-stage chain runs: firmware PXE ROM → TFTP `undionly.kpxe` → iPXE → HTTP. The dnsmasq config in §4.5 handles it as written.
+
+#### Common to both
 
 **D5.** Internally, close the **`JPWR`** jumper so the unit powers on automatically when power is restored. Without it, a power cut means walking to the closet and pressing three buttons.
 
 **D6.** **Cable only ONE NIC** — the port labeled `WAN`. Leave `LAN` unplugged. The `${mac}` substitution in `talos.config` resolves to *"the MAC address of the first network interface attaining link state up"*, which is a coin flip with both ports patched in.
 
-Repeat D1–D6 for all three units.
+**D7.** Repeat for all four units. Don't mix firmware across the four if you can avoid it — identical boot behaviour is worth more than it sounds when you're debugging at 1am.
 
 ---
 
@@ -792,9 +890,9 @@ Do **one node only**, and watch it. If it works, the other two are copy-paste.
 DHCPDISCOVER(enp0s31f6) aa:bb:cc:dd:ee:01
 PXE(enp0s31f6) aa:bb:cc:dd:ee:01 proxy
 ...  undionly.kpxe
-sent /var/lib/tftpboot/undionly.kpxe to 192.168.1.211
+sent /var/lib/tftpboot/undionly.kpxe to 10.0.2.151
 DHCPDISCOVER(enp0s31f6) aa:bb:cc:dd:ee:01          <- now from iPXE
-... http://192.168.1.210:8080/boot.ipxe
+... http://10.0.2.150:8080/boot.ipxe
 ```
 
 **E2.** Then in the nginx log:
@@ -803,7 +901,7 @@ DHCPDISCOVER(enp0s31f6) aa:bb:cc:dd:ee:01          <- now from iPXE
 kubectl -n netboot logs -f deploy/nginx
 ```
 
-Expect `GET /boot.ipxe`, `GET /assets/vmlinuz-amd64`, `GET /assets/initramfs-amd64.xz`, `GET /config/worker.yaml` — all `200`, all from `192.168.1.211`.
+Expect `GET /boot.ipxe`, `GET /assets/vmlinuz-amd64`, `GET /assets/initramfs-amd64.xz`, `GET /config/worker.yaml` — all `200`, all from `10.0.2.151`.
 
 **E3.** Watch it join:
 
@@ -816,15 +914,15 @@ kubectl get nodes -w
 **E4.** Confirm what actually got provisioned on the mSATA:
 
 ```bash
-talosctl -n 192.168.1.210 get volumestatus
-talosctl -n 192.168.1.210 dmesg | tail -50
+talosctl -n 10.0.2.151 get volumestatus
+talosctl -n 10.0.2.151 dmesg | tail -50
 ```
 
 **E5.** **The critical test — reboot it and confirm it netboots again**, rather than booting from disk:
 
 ```bash
 kubectl -n netboot logs -f deploy/nginx &     # keep watching
-talosctl -n 192.168.1.210 reboot
+talosctl -n 10.0.2.151 reboot
 ```
 
 A fresh `GET /config/worker.yaml` in the nginx log means netboot-every-boot is working. **No fetch means the node booted from disk** — see §7.1.
@@ -833,16 +931,16 @@ A fresh `GET /config/worker.yaml` in the nginx log means netboot-every-boot is w
 
 ### Phase F — Remaining workers
 
-**F1.** Power on `wn-02`, `wn-03` and `wn-04`. No per-node configuration required — same `worker.yaml`, hostnames from DHCP reservations.
+**F1.** Power on `wn-02`, `wn-03` and `wn-04`, one at a time. No per-node configuration required — same `worker.yaml`, hostnames from DHCP reservations.
 
 **F2.** Final state check:
 
 ```bash
 kubectl get nodes -o wide
-talosctl -n 192.168.1.210 health --wait-timeout 10m
+talosctl -n 10.0.2.150 health --wait-timeout 10m
 ```
 
-Expect four nodes `Ready`: `cp-00` (control-plane) and `wn-01/02/03/04`.
+Expect five nodes `Ready`: `cp-01` (control-plane) and `wn-01`/`02`/`03`/`04`.
 
 **F3.** Commit the repo — **without** the files listed in §4.11.
 
@@ -862,17 +960,17 @@ Store `secrets.yaml` and `talosconfig` in a password manager. They are not regen
 kubectl get nodes -o wide
 
 # Talos-level health
-talosctl -n 192.168.1.210 health --wait-timeout 10m
+talosctl -n 10.0.2.150 health --wait-timeout 10m
 
 # workers have the expected label and no install section took effect
 kubectl get nodes -l hardware=fw2b
-talosctl -n 192.168.1.211,192.168.1.212,192.168.1.213,192.168.1.214 get volumestatus
+talosctl -n 10.0.2.151,10.0.2.152,10.0.2.153,10.0.2.154 get volumestatus
 
 # netboot stack running on the control plane only
 kubectl -n netboot get pods -o wide
 
 # config server still refuses non-workers
-curl -s -o /dev/null -w '%{http_code}\n' http://192.168.1.210:8080/config/worker.yaml   # 403
+curl -s -o /dev/null -w '%{http_code}\n' http://10.0.2.150:8080/config/worker.yaml   # 403
 
 # schedule something and confirm it lands
 kubectl create deployment nginx-test --image=nginx:alpine --replicas=3
@@ -887,7 +985,10 @@ kubectl delete deployment nginx-test
 | Symptom | Cause | Check |
 |---|---|---|
 | `PXE-E53: No boot filename received` | proxyDHCP not answering | dnsmasq logs; is `interface=` correct (step C1)? Is the pod `hostNetwork`? |
-| No PXE device in the FW2B boot menu | CSM Network not set to Legacy | Redo step **D2** |
+| No PXE device in the FW2B boot menu (AMI) | CSM Network not set to Legacy | Redo step **D-ami-2** |
+| No network entry in the `F11` menu (coreboot) | this coreboot build lacks the iPXE ROM | Use the USB-iPXE fallback in **D-core-3** |
+| coreboot unit needs manual `F11` every boot | SeaBIOS isn't falling through to the network BEV | **D-core-3** fallback table |
+| TFTP never appears in the dnsmasq log on coreboot | **expected** — firmware iPXE skips the chainload stage | Not a fault; see **D-core** |
 | iPXE loads, then loads iPXE again, forever | missing `tag:!ipxe` on `pxe-service` | `k8s/10-cm-dnsmasq.yaml` |
 | iPXE: `Connection timed out (http://…:8080)` | nginx not reachable on host network | `kubectl -n netboot get pods -o wide`; `curl` from workstation |
 | iPXE: `Error 0x3f...` fetching kernel | asset job never completed | `kubectl -n netboot logs job/fetch-assets` |
@@ -907,17 +1008,17 @@ Symptom: after a reboot, nginx logs no `/config/worker.yaml` fetch, but the node
    kubectl -n netboot get secret machine-config -o jsonpath='{.data.worker\.yaml}' \
      | base64 -d | grep -c 'install:'      # expect 0
    ```
-2. Confirm the mSATA is not in the BIOS boot order (step **D4**).
+2. Confirm the mSATA is not in the boot order (step **D-ami-4**; on coreboot there's nothing to set — SeaBIOS skips a disk with no bootloader).
 3. Wipe and let it rebuild:
    ```bash
-   talosctl -n 192.168.1.210 reset --graceful=false --reboot \
+   talosctl -n 10.0.2.151 reset --graceful=false --reboot \
      --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL
    ```
 4. If it keeps installing, accept the fallback: add `machine.install: {disk: /dev/sda}` to `patches/worker.yaml`, regenerate (**A5**), update the Secret (**C4**), and set the BIOS boot order to disk-first / network-fallback. You lose netboot-every-boot; you keep everything else.
 
 ### 7.2 Testing whether true zero-disk works
 
-Curiosity satisfied cheaply: pull the mSATA out of `wn-03` and boot it. If it joins and reaches `Ready`, your Talos build tolerates a diskless worker. If it hangs in maintenance mode, you've confirmed the STATE requirement from §2 and the current design is the right one.
+Curiosity satisfied cheaply: pull the mSATA out of `wn-04` and boot it. If it joins and reaches `Ready`, your Talos build tolerates a diskless worker. If it hangs in maintenance mode, you've confirmed the STATE requirement from §2 and the current design is the right one.
 
 ---
 
@@ -935,11 +1036,10 @@ kubectl apply -f k8s/20-job-fetch-assets.yaml
 kubectl -n netboot wait --for=condition=complete job/fetch-assets --timeout=300s
 
 # 3. roll the workers one at a time
-for ip in 192.168.1.211 192.168.1.212 192.168.1.213 192.168.1.214; do
-  kubectl drain "$(kubectl get node -o name | grep "${ip##*.}")" --ignore-daemonsets --delete-emptydir-data || true
-  talosctl -n "$ip" reboot
-  sleep 120
-  kubectl get nodes
+for n in 01 02 03 04; do
+  kubectl drain "wn-${n}" --ignore-daemonsets --delete-emptydir-data || true
+  talosctl -n "10.0.2.$((150 + 10#$n))" reboot
+  kubectl wait --for=condition=Ready "node/wn-${n}" --timeout=10m
 done
 ```
 
@@ -948,7 +1048,7 @@ This is the payoff of netboot-every-boot: no per-node upgrade orchestration, no 
 ### 8.2 Upgrading the control plane — normal Talos upgrade
 
 ```bash
-talosctl -n 192.168.1.210 upgrade \
+talosctl -n 10.0.2.150 upgrade \
   --image factory.talos.dev/installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:v1.13.7
 ```
 
@@ -957,7 +1057,7 @@ The installer schematic **must match** the schematic used for the boot assets.
 ### 8.3 Backups — do this before you need it
 
 ```bash
-talosctl -n 192.168.1.210 etcd snapshot etcd-$(date +%F).db
+talosctl -n 10.0.2.150 etcd snapshot etcd-$(date +%F).db
 ```
 
 Single control plane means no quorum to save you. The three things that make a rebuild a 30-minute job instead of starting over:
@@ -971,7 +1071,7 @@ Schedule the snapshot. Store all three off the cluster.
 ### 8.4 Rebuilding a worker from scratch
 
 ```bash
-talosctl -n 192.168.1.212 reset --graceful=false --reboot \
+talosctl -n 10.0.2.152 reset --graceful=false --reboot \
   --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL
 ```
 
@@ -982,7 +1082,7 @@ It netboots, refetches `worker.yaml`, and rejoins. Nothing to reinstall.
 The nginx allowlist is a speed bump, not a boundary. In rough order of cost:
 
 1. **VLAN the cluster.** Node ports must be **untagged access ports** — the i211 option ROM has no 802.1Q awareness and stage-1 iPXE DHCPs untagged, so a tagged trunk means DHCP silently finds nothing. Firewall LAN→cluster down to tcp/6443 and tcp/50000; explicitly deny tcp/8080, udp/69, udp/67.
-2. **Bind nginx to the cluster VLAN address** (`listen 192.168.20.10:8080`) once the NUC has more than one address. Set `net.ipv4.ip_nonlocal_bind: "1"` in the control plane's `machine.sysctls`, or nginx will crashloop when it starts before the address is up.
+2. **Bind nginx to the cluster VLAN address** (`listen 10.0.20.10:8080`) once the NUC has more than one address. Set `net.ipv4.ip_nonlocal_bind: "1"` in the control plane's `machine.sysctls`, or nginx will crashloop when it starts before the address is up.
 3. **`talos.config.auth.*` OAuth2** for authenticated config delivery. The designed-for-this answer, but it means depending on an OIDC provider.
 
 HTTPS is deliberately not on that list: the URL is published in plaintext inside `boot.ipxe`, and there's no client authentication, so anyone who can reach the port can still just fetch it. Confidentiality in transit isn't the problem here — authorization is.
@@ -1000,6 +1100,512 @@ HTTPS is deliberately not on that list: the URL is published in plaintext inside
 5. **Config server on plain HTTP.** §8.5.
 6. **Router is a dependency.** Losing DHCP reservations means workers get wrong IPs, fail the nginx allowlist, and fail to boot. Back up your router config.
 
+If you take on §10, add these:
+
+7. **CPU-heterogeneous checkpoint/restore.** A gVisor snapshot from the NUC will not restore on a FW2B. Mitigated only by the `nodeSelector` in §10.10 — there is no runtime guard. See §2.
+8. **Substrate is pre-release.** `v0.0.0`, no published images, APIs expected to change, GKE-shaped install path. Every upgrade is a rebuild from source.
+9. **Snapshots are the sole copy of actor state**, on a beta single-node object store on one box. §10.14.
+10. **1GbE bounds activation latency.** RAM images over the wire; seconds, not milliseconds. §10.13.
+
+---
+
+## 10. Agent Substrate + RustFS
+
+Everything in this section is optional and independent of §1–§9. Do it only after §6 passes.
+
+> **Maturity warning, stated once.** Agent Substrate self-describes as "VERY early development... APIs are almost guaranteed to change." Its only release is `v0.0.0 - initial commit`. There are **no published container images** — every component is a `ko://` reference built from source. The non-kind install path assumes GKE, GCS, and Memorystore; you are porting it to bare metal. RustFS is at `1.0.0-beta`. Treat this as an experiment you can rebuild, not infrastructure you depend on.
+
+### 10.1 Placement
+
+| Component | Where | Why |
+|---|---|---|
+| `ate-api-server`, `ate-controller`, `atenet-router`, `atenet-dns` | **NUC** (control plane) | Control-plane latency, and the FW2Bs have no spare cores |
+| `valkey-cluster` (StatefulSet) | **NUC** | Actor registry; needs a real disk. **Substrate deploys this itself** — you don't install Valkey separately, you pin the StatefulSet it creates |
+| `podcertificate-controller` | **NUC** | Signs pod certs for the mTLS mesh |
+| `atelet` (DaemonSet) | **all nodes** | Node agent; does snapshot I/O. Leave it unpinned |
+| Worker pods / actors | **FW2Bs only** | Enforced by `nodeSelector: hardware: fw2b` — see §2 |
+| **RustFS** | **DGX Spark**, outside the cluster | 4 TB NVMe, and keeps snapshot state off disposable workers |
+
+The stock install deploys RustFS *in-cluster* as part of the kind overlay. §10.5 replaces that with the Spark.
+
+### 10.2 Prerequisites
+
+| Requirement | Where it's handled |
+|---|---|
+| Kubernetes ≥ 1.36 | §10.3 — Substrate supports latest stable and one minor back |
+| `ClusterTrustBundle`, `ClusterTrustBundleProjection`, `PodCertificateRequest` gates + `certificates.k8s.io/v1beta1` | §4.2 (control plane) and §4.3 (kubelet) |
+| `user.max_user_namespaces`, `net.ipv4.conf.all.proxy_arp` | §4.3 (workers) |
+| A container registry the cluster can pull from | §10.4 |
+| RustFS reachable over S3 | §10.5 |
+| Go, `ko`, `kustomize`, `jq`, `docker` on your workstation | §10.6 |
+
+**You do not need the `siderolabs/gvisor` system extension.** Substrate fetches its own `runsc` binary via `SandboxConfig` and runs it inside the worker pod. Your schematic ID and netboot assets from §4.1 are unchanged — nothing in §3–§7 needs to be redone.
+
+### 10.3 Upgrade Kubernetes to 1.36
+
+Talos v1.13.6 ships Kubernetes 1.35, which is one minor behind. Upgrade before installing:
+
+```bash
+talosctl --nodes 10.0.2.150 upgrade-k8s --to 1.36.1
+kubectl version
+kubectl get nodes -o wide     # all four still Ready
+```
+
+Then apply the §4.2/§4.3 patches if you haven't already:
+
+```bash
+# regenerate with the new patches
+talosctl gen config homelab https://10.0.2.150:6443 \
+  --with-secrets secrets.yaml \
+  --config-patch-control-plane @patches/controlplane.yaml \
+  --config-patch-worker @patches/worker.yaml \
+  --with-docs=false --with-examples=false --output-dir . --force
+
+talosctl -n 10.0.2.150 apply-config -f controlplane.yaml
+
+# workers pick the new config up on next boot — refresh the served copy first
+kubectl -n netboot create secret generic machine-config \
+  --from-file=worker.yaml=./worker.yaml \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+for ip in 10.0.2.151 10.0.2.152 10.0.2.153 10.0.2.154; do talosctl -n $ip reboot; sleep 120; done
+```
+
+Verify the gates actually took:
+
+```bash
+kubectl api-resources | grep -i clustertrustbundle    # must return rows
+kubectl get --raw /apis/certificates.k8s.io/v1beta1 | jq -r '.resources[].name'
+talosctl -n 10.0.2.151 read /proc/sys/user/max_user_namespaces   # 11255
+```
+
+If `clustertrustbundles` is missing, stop. The Substrate install will hang forever at "Waiting for podcertificate ClusterTrustBundles to be ready".
+
+### 10.4 Container registry on the Spark
+
+There are no published Substrate images, so you need a registry the cluster can pull from. Simplest is one on the Spark alongside RustFS.
+
+```bash
+# on the DGX Spark (10.0.2.160)
+sudo mkdir -p /srv/registry
+docker run -d --name registry --restart unless-stopped \
+  -p 5000:5000 -v /srv/registry:/var/lib/registry \
+  registry:3
+```
+
+Talos must be told this registry is plain HTTP. This lives in **`patches/registry-mirror.yaml`**:
+
+```yaml
+---
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+mirrors:
+  10.0.2.160:5000:
+    endpoints:
+      - url: http://10.0.2.160:5000
+        overridePath: true
+```
+
+Append it to both generated configs after running `talosctl gen config` — it is a standalone config document, so a plain concatenation is enough:
+
+```bash
+cat patches/registry-mirror.yaml >> controlplane.yaml
+cat patches/registry-mirror.yaml >> worker.yaml
+```
+
+> `RegistryMirrorConfig` is the current form; the older `machine.registries.mirrors` still works but is deprecated as of Talos 1.12. If you'd rather avoid an insecure registry entirely, push to `ghcr.io` instead and skip this — then `KO_DOCKER_REPO=ghcr.io/<you>` in §10.6 and ensure the images are public or add an imagePullSecret.
+
+### 10.5 RustFS on the DGX Spark
+
+The Spark is arm64 (GB10, 20-core Arm) running DGX OS — Ubuntu 24.04. RustFS publishes arm64 images, so this is a straight `docker run`.
+
+```bash
+# on the DGX Spark
+sudo mkdir -p /srv/rustfs/{data,logs}
+sudo chown -R 10001:10001 /srv/rustfs      # container runs as UID/GID 10001
+
+docker run -d --name rustfs --restart unless-stopped \
+  -p 9000:9000 -p 9001:9001 \
+  -v /srv/rustfs/data:/data \
+  -v /srv/rustfs/logs:/logs \
+  -e RUSTFS_ADDRESS=":9000" \
+  -e RUSTFS_CONSOLE_ADDRESS=":9001" \
+  -e RUSTFS_CONSOLE_ENABLE="true" \
+  -e RUSTFS_VOLUMES="/data" \
+  -e RUSTFS_ACCESS_KEY="substrate" \
+  -e RUSTFS_SECRET_KEY="<a real password>" \
+  rustfs/rustfs:1.0.0-beta.3
+```
+
+> Pin the tag. Substrate's own manifest pins `rustfs/rustfs:1.0.0-beta.3@sha256:378642b0...` — matching their tested version is the safer choice on a beta storage engine. And change the credentials: the upstream default is `rustfsadmin`/`rustfsadmin`, which is fine inside a kind cluster and not fine on your LAN.
+
+Create the bucket:
+
+```bash
+# from your workstation, with awscli installed
+export AWS_ACCESS_KEY_ID=substrate
+export AWS_SECRET_ACCESS_KEY='<a real password>'
+export AWS_REGION=us-east-1
+aws --endpoint-url http://10.0.2.160:9000 s3api create-bucket --bucket ate-snapshots
+aws --endpoint-url http://10.0.2.160:9000 s3 ls
+```
+
+Store the credentials as a Secret rather than inlining them the way upstream does (their manifest carries a `TODO: use a secret / identity management`):
+
+```bash
+kubectl create namespace ate-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n ate-system create secret generic rustfs-credentials \
+  --from-literal=AWS_ACCESS_KEY_ID=substrate \
+  --from-literal=AWS_SECRET_ACCESS_KEY='<a real password>'
+```
+
+### 10.6 Build and push the Substrate images
+
+```bash
+git clone https://github.com/agent-substrate/substrate.git
+cd substrate
+
+export KO_DOCKER_REPO=10.0.2.160:5000
+export KO_DEFAULTPLATFORMS=linux/amd64      # all four cluster nodes are amd64
+export NO_DEV_ENV=true
+export BUCKET_NAME=ate-snapshots
+```
+
+`KO_DEFAULTPLATFORMS=linux/amd64` matters: the Spark is arm64, so `ko` would otherwise build for the wrong architecture if it inferred from the host. Build on an amd64 workstation, or set this explicitly.
+
+### 10.7 The `homelab` kustomize overlay
+
+Upstream ships two overlays: `manifests/ate-install` (GKE) and `manifests/ate-install/kind`. Neither fits — the GKE one wants GCS, the kind one deploys RustFS in-cluster. Create a third in your checkout:
+
+**`manifests/ate-install/homelab/kustomization.yaml`**
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../ate-api-server.yaml
+  - ../ate-controller.yaml
+  - ../atelet.yaml
+  - ../atenet-dns.yaml
+  - ../atenet-router.yaml
+  - ../valkey.yaml
+  - ../pod-certificate-controller.yaml
+  # NOTE: no rustfs.yaml — RustFS lives on the Spark (§10.5)
+  # NOTE: no otel-collector / prometheus — add later if you want them
+
+patches:
+  # ---- atelet: point snapshot storage at RustFS on the Spark ----
+  - patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: atelet
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            containers:
+            - name: atelet
+              args:
+              - --gcp-auth-for-image-pulls=false
+              - --grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+              - --client-ca-certs=/run/podidentity.podcert.ate.dev/trust-bundle.pem
+              env:
+              - name: ATE_STORAGE_BACKEND
+                value: s3
+              - name: AWS_REGION
+                value: us-east-1
+              - name: AWS_ENDPOINT_URL
+                value: http://10.0.2.160:9000
+              - name: AWS_S3_USE_PATH_STYLE
+                value: "true"
+              - name: AWS_ACCESS_KEY_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: rustfs-credentials
+                    key: AWS_ACCESS_KEY_ID
+              - name: AWS_SECRET_ACCESS_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: rustfs-credentials
+                    key: AWS_SECRET_ACCESS_KEY
+              - name: OTEL_EXPORTER_OTLP_ENDPOINT
+                value: ""
+
+  # ---- Valkey pinned to the NUC ----
+  - patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: valkey-cluster
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              node-role.kubernetes.io/control-plane: ""
+
+  # ---- control-plane components pinned to the NUC ----
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ate-api-server
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              node-role.kubernetes.io/control-plane: ""
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ate-controller
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              node-role.kubernetes.io/control-plane: ""
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: atenet-router
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              node-role.kubernetes.io/control-plane: ""
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: dns
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              node-role.kubernetes.io/control-plane: ""
+```
+
+> ⚠️ **The `gs://` scheme is a red herring.** Snapshot locations in `ActorTemplate.snapshotsConfig.location` are written as `gs://<bucket>/<path>/` **even when the backend is S3** — upstream's own kind demos do exactly this while writing to RustFS. The backend is chosen by `ATE_STORAGE_BACKEND` on atelet, not by the URL scheme. Do not "fix" it to `s3://`.
+
+### 10.8 SandboxConfig — the `runsc` binary
+
+`deploy_ate_system` applies a cluster default `SandboxConfig` named `gvisor-default`, whose assets point at gVisor nightly builds on Google Cloud Storage. Check what scheme it uses:
+
+```bash
+kubectl get sandboxconfig gvisor-default -o yaml
+```
+
+If the `url` is `gs://...` and your cluster has no GCP credentials, override it with the public HTTPS equivalent (**`substrate/sandboxconfig-gvisor-homelab.yaml`**):
+
+```yaml
+apiVersion: ate.dev/v1alpha1
+kind: SandboxConfig
+metadata:
+  name: gvisor-homelab
+spec:
+  sandboxClass: gvisor
+  default: true
+  assets:
+    amd64:
+      runsc:
+        url: "https://storage.googleapis.com/gvisor/releases/nightly/2026-05-19/x86_64/runsc"
+        sha256: "a397be1abc2420d26bce6c70e6e2ff96c73aaaab929756c56f5e2089ea842b63"
+```
+
+Set `default: false` on `gvisor-default` first — at most one default is allowed per `sandboxClass`, and a `ValidatingAdmissionPolicy` enforces it. Verify the sha256 against whatever release you actually point at; the digest above is the one in upstream's example and is version-specific.
+
+### 10.9 Install
+
+```bash
+cd substrate
+export KUBECONFIG=/path/to/kubeconfig
+
+# 1. CRDs and the SandboxConfig validation policy
+./hack/run-tool.sh ko apply -f manifests/ate-install/generated
+kubectl apply -f manifests/ate-install/sandboxconfig-validation.yaml
+kubectl apply -f manifests/ate-install/sandboxconfig-gvisor.yaml
+
+# 2. Namespace — confirm it carries PSA privileged labels; add them if not
+kubectl apply -f manifests/ate-install/ate-system-namespace.yaml
+kubectl get ns ate-system --show-labels
+kubectl label ns ate-system \
+  pod-security.kubernetes.io/enforce=privileged \
+  pod-security.kubernetes.io/audit=privileged \
+  pod-security.kubernetes.io/warn=privileged --overwrite
+
+# 3. RustFS credentials (§10.5) must exist before atelet starts
+kubectl -n ate-system get secret rustfs-credentials
+
+# 4. CAs, JWT pools, apiserver env — reuse upstream's helpers
+./hack/install-ate.sh --create-podcertificate-controller-cas
+./hack/install-ate.sh --create-jwt-authority-pool-secret
+./hack/install-ate.sh --create-session-id-ca-pool-secret
+
+# 5. podcertificate-controller, then wait for the trust bundles
+./hack/run-tool.sh ko apply -f manifests/ate-install/pod-certificate-controller.yaml
+kubectl rollout status deployment/podcertificate-controller -n podcertificate-controller-system --timeout=120s
+kubectl get clustertrustbundles
+
+# 6. Valkey CA certs (depends on step 5 having produced the CA pools)
+./hack/install-ate.sh --create-valkey-ca-certs-secret
+./hack/install-ate.sh --create-api-server-env-vars
+
+# 7. The system itself, through the homelab overlay
+kubectl kustomize manifests/ate-install/homelab --load-restrictor LoadRestrictionsNone \
+  | ./hack/run-tool.sh ko resolve -f - \
+  | kubectl apply -f -
+
+# 8. Wait
+kubectl rollout status deployment/ate-api-server  -n ate-system --timeout=300s
+kubectl rollout status deployment/ate-controller  -n ate-system --timeout=300s
+kubectl rollout status deployment/atenet-router   -n ate-system --timeout=300s
+kubectl rollout status statefulset/valkey-cluster -n ate-system --timeout=300s
+kubectl rollout status daemonset/atelet           -n ate-system --timeout=300s
+```
+
+Step 5 is the one that hangs if §10.3 didn't take. If `kubectl get clustertrustbundles` returns `the server doesn't have a resource type`, go back and fix the feature gates.
+
+### 10.10 WorkerPool — FW2B only
+
+This is the piece that keeps §2's CPU problem from biting you. File: **`substrate/workerpool-fw2b.yaml`**.
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+---
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: fw2b-pool
+  namespace: ate-demo
+  labels:
+    workload: homelab
+spec:
+  # 4 nodes × 2 warm pods. Each worker pod holds a gVisor sandbox in RAM.
+  replicas: 8
+  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
+  sandboxClass: gvisor
+  template:
+    # THE important line. Never let the NUC into this pool — see §2.
+    nodeSelector:
+      hardware: fw2b
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1500Mi
+```
+
+Sizing rationale for an 8 GB / 2-core FW2B: Talos plus kubelet takes ~1–1.5 GB, and `systemReserved`/`evictionHard` from §4.3 hold back another ~750 MB. That leaves roughly 5.5–6 GB per node. Two worker pods at a 1.5 GB limit is ~3 GB, which leaves headroom for atelet, the CNI, and actor filesystem cache. Across four FW2Bs that's 8 warm pods. Raise `replicas` only after watching real memory under load.
+
+### 10.11 ActorTemplate
+
+File: **`substrate/ate-demo-counter.yaml`**.
+
+```yaml
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: counter
+  namespace: ate-demo
+spec:
+  sandboxClass: gvisor
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  containers:
+  - name: counter
+    image: ko://github.com/agent-substrate/substrate/demos/counter
+    command:
+    - /ko-app/counter
+    readyz:
+      httpGet:
+        path: /readyz
+        port: 80
+    volumeMounts:
+    - name: data
+      mountPath: /home/counter
+  workerSelector:
+    matchLabels:
+      workload: homelab          # must match the WorkerPool's labels
+  snapshotsConfig:
+    onPause: Full
+    onCommit: Data
+    location: gs://ate-snapshots/ate-demo-counter/     # gs:// — see §10.7
+  volumes:
+  - name: data
+    durableDir: {}
+```
+
+Apply it through `ko` so the `ko://` reference resolves:
+
+```bash
+./hack/run-tool.sh ko apply -f <path-to>/substrate/ate-demo-counter.yaml
+kubectl -n ate-demo get actortemplate counter -o jsonpath='{.status.phase}'   # want: Ready
+```
+
+The golden snapshot is taken on whichever worker the golden pod lands on — which, thanks to the `nodeSelector`, is always a FW2B. That's the invariant that makes restores work.
+
+### 10.12 Verify end to end
+
+```bash
+go install ./cmd/kubectl-ate
+
+kubectl ate create actor my-counter-1 --template ate-demo/counter
+kubectl ate get actors -A
+
+# snapshot actually landed on the Spark
+aws --endpoint-url http://10.0.2.160:9000 s3 ls s3://ate-snapshots/ate-demo-counter/ --recursive
+
+# exercise it
+kubectl port-forward -n ate-system svc/atenet-router 8000:80 &
+curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" -i http://localhost:8000/
+
+# suspend / resume round trip — this is the real test
+kubectl ate suspend actor my-counter-1 -a ate-demo
+kubectl ate resume  actor my-counter-1 -a ate-demo
+curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" -i http://localhost:8000/
+```
+
+The counter must keep its value across suspend/resume. If it does, RAM snapshotting to the Spark works. Then suspend, cordon the node it was on, and resume — it should come back on a *different* FW2B. That proves cross-node restore, which is the whole point.
+
+### 10.13 Expect this to be slow, and why
+
+Snapshots are **RAM images** moving over 1GbE at roughly 110 MB/s. A 512 MB actor is ~5 seconds each way. Upstream's "sub-second activation" assumes cloud networking and local SSD; you will not see it. Moving RustFS onto the NUC wouldn't help either — the FW2B's single 1GbE NIC is the bottleneck regardless of where the store sits.
+
+**The one real mitigation you already own:** each FW2B has a second, unused i211. PXE happens on `eth0` before the machine config applies, so bringing up the second NIC afterwards costs you nothing in §5 and doesn't affect `${mac}` determinism. Add to `patches/worker.yaml`:
+
+```yaml
+---
+apiVersion: v1alpha1
+kind: DHCPv4Config
+name: <second interface name>     # confirm with: talosctl -n <ip> get links
+```
+
+Then give the Spark an address on that segment and point `AWS_ENDPOINT_URL` at it. Worth doing only after you've measured the default path and confirmed the network is actually the limit.
+
+### 10.14 What to watch
+
+1. **Never add the NUC to a WorkerPool.** §2. This is the failure that will look like a Substrate bug and isn't.
+2. **`gs://` in `snapshotsConfig.location` is correct with an S3 backend.** §10.7.
+3. **Snapshots are the only copy of actor state.** RustFS is beta, single-node, on one box. Back `/srv/rustfs/data` up, or accept that a Spark disk failure loses every actor.
+4. **Talos upgrades reset worker sysctls** only if you forget to re-serve `worker.yaml`. The §8.1 upgrade flow refreshes assets but not the config Secret — re-run the §10.3 secret refresh whenever `patches/worker.yaml` changes.
+5. **`user.max_user_namespaces` weakens KSPP hardening** on the workers. §4.3.
+6. **Pin every image by digest in ActorTemplates.** Changing an image invalidates snapshots, and upstream requires digest pinning for exactly this reason.
 ---
 
 ## Sources
@@ -1017,3 +1623,12 @@ HTTPS is deliberately not on that list: the URL is published in plaintext inside
 - [Protectli KB — How to Enable PXE on the Vault](https://kb.protectli.com/kb/how-to-enable-pxe-on-the-vault/)
 - [Protectli KB — coreboot information](https://kb.protectli.com/kb/coreboot-information/)
 - [Celeron J3060 — WikiChip](https://en.wikichip.org/wiki/intel/celeron/j3060)
+- [Agent Substrate](https://github.com/agent-substrate/substrate)
+- [Substrate API guide (WorkerPool / ActorTemplate / SandboxConfig)](https://github.com/agent-substrate/substrate/blob/main/docs/api-guide.md)
+- [Substrate kind cluster config — required feature gates](https://github.com/agent-substrate/substrate/blob/main/hack/create-kind-cluster.sh)
+- [Substrate atelet S3 wiring (kind overlay)](https://github.com/agent-substrate/substrate/blob/main/manifests/ate-install/kind/atelet/kustomization.yaml)
+- [Substrate RustFS manifest](https://github.com/agent-substrate/substrate/blob/main/manifests/ate-install/kind/rustfs.yaml)
+- [gVisor checkpoint/restore](https://gvisor.dev/docs/user_guide/checkpoint_restore/)
+- [gvisor#11486 — checkpoint/restore across differing CPU features](https://github.com/google/gvisor/issues/11486)
+- [Talos gVisor extension (user namespace sysctl)](https://github.com/siderolabs/extensions/tree/main/container-runtime/gvisor)
+- [RustFS](https://github.com/rustfs/rustfs)

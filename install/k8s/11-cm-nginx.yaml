@@ -34,13 +34,13 @@ data:
         }
 
         # Machine config contains cluster join tokens.
-        # Allowlist the three workers, log every request, deny everything else.
+        # Allowlist the four workers, log every request, deny everything else.
         location /config/ {
           alias /srv/config/;
-          allow 192.168.1.211;
-          allow 192.168.1.212;
-          allow 192.168.1.213;
-          allow 192.168.1.214;
+          allow 10.0.2.151;
+          allow 10.0.2.152;
+          allow 10.0.2.153;
+          allow 10.0.2.154;
           deny  all;
           default_type text/yaml;
           access_log /dev/stdout;

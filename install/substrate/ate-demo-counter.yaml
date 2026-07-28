@@ -1,0 +1,30 @@
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: counter
+  namespace: ate-demo
+spec:
+  sandboxClass: gvisor
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  containers:
+  - name: counter
+    image: ko://github.com/agent-substrate/substrate/demos/counter
+    command:
+    - /ko-app/counter
+    readyz:
+      httpGet:
+        path: /readyz
+        port: 80
+    volumeMounts:
+    - name: data
+      mountPath: /home/counter
+  workerSelector:
+    matchLabels:
+      workload: homelab          # must match the WorkerPool's labels
+  snapshotsConfig:
+    onPause: Full
+    onCommit: Data
+    location: gs://ate-snapshots/ate-demo-counter/     # gs:// — see §10.7
+  volumes:
+  - name: data
+    durableDir: {}
