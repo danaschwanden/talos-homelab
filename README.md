@@ -1505,7 +1505,7 @@ kubectl get clustertrustbundles
 ./hack/install-ate.sh --create-api-server-env-vars
 
 # 7. The system itself, through the homelab overlay
-kubectl apply -f install/patches/local-path-provisioner/local-path-provisioner.yaml
+talosctl --nodes 10.0.2.150 patch mc --patch @install/patches/local-path-provisioner/local-path-provisioner.yaml
 kubectl kustomize manifests/ate-install/homelab --load-restrictor LoadRestrictionsNone \
   | ./hack/run-tool.sh ko resolve -f - \
   | kubectl apply -f -
