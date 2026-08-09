@@ -22,6 +22,38 @@
 
 **Not HA.** One control plane means no etcd quorum. If the NUC is down, the Kubernetes API is down and no worker can boot. That is an accepted tradeoff of this design, not an oversight — see §8.
 
+```
+
+                         +----------------------+
+                         | router / gateway     |
+                         | 10.0.2.1             |
+                         | DHCP server          |
+                         +----------+-----------+
+                                    |
+                                    | LAN 10.0.2.0/24
+                                    |
+          +-------------------------+-------------------------+
+          |                                                   |
+          v                                                   v
++----------------------+                           +----------------------+
+| cp-01                |                           | dgx-spark            |
+| 10.0.2.150           |                           | 10.0.2.160           |
+| control plane        |                           | snapshot store       |
+| netboot server       |                           +----------------------+
++----------+-----------+
+           |
+           | PXE / HTTP netboot
+           |
+   +-------+--------+--------+--------+
+   |                |        |        |
+   v                v        v        v
++--------+       +--------+ +--------+ +--------+
+| wn-01  |       | wn-02  | | wn-03  | | wn-04  |
+| .151   |       | .152   | | .153   | | .154   |
++--------+       +--------+ +--------+ +--------+
+
+```
+
 ---
 
 ## 2. Hardware constraints you must know before starting
@@ -131,8 +163,12 @@ talos-homelab/
 ├── schematic.yaml
 ├── patches/
 │   ├── controlplane.yaml
+│   ├── local-path-provisioner/
+│   │   ├── kustomization.yaml
+│   │   └── local-path-provisioner.yaml
 │   ├── worker.yaml
-│   └── registry-mirror.yaml          # §10 only
+│   ├── patch-hostname.yaml
+│   └── patch-registry-mirror.yaml          # §10 only
 ├── k8s/
 │   ├── 00-namespace.yaml
 │   ├── 10-cm-dnsmasq.yaml
@@ -141,12 +177,11 @@ talos-homelab/
 │   ├── 20-job-fetch-assets.yaml
 │   ├── 30-deploy-dnsmasq.yaml
 │   └── 31-deploy-nginx.yaml
-└── substrate/                        # §10 only
-    ├── sandboxconfig-gvisor-homelab.yaml
-    ├── workerpool-fw2b.yaml
-    ├── ate-demo-counter.yaml
-    └── manifests/ate-install/homelab/
-        └── kustomization.yaml        # copy into your substrate checkout
+└── substrate/                           # §10 only
+    ├── ate-demo-counter.yaml 
+    ├── manifests/ate-install/homelab/
+    │   └── kustomization.yaml        # copy into your substrate checkoutworkerpool-fw2b.yaml
+    └── sandboxconfig-gvisor-homelab.yaml
 ```
 
 `talosctl gen config` will later add `controlplane.yaml`, `worker.yaml`, `secrets.yaml`, and `talosconfig` at the root. **Those four contain secrets — see §4.11 before committing anything to git.**
@@ -662,7 +697,13 @@ Put that ID into `k8s/20-job-fetch-assets.yaml` (`SCHEMATIC` env var).
 talosctl gen secrets -o secrets.yaml
 ```
 
-**A5.** Generate the machine configs with both patches applied in one shot:
+**A5.** Add hostname configuration:
+
+```bash
+cat patches/patch-hostname.yaml >> controlplane.yaml
+```
+
+**A6.** Generate the machine configs with both patches applied in one shot:
 
 ```bash
 talosctl gen config homelab https://10.0.2.150:6443 \
@@ -676,7 +717,7 @@ talosctl gen config homelab https://10.0.2.150:6443 \
 
 Produces `controlplane.yaml`, `worker.yaml`, `talosconfig`.
 
-**A6.** Sanity-check the two things most likely to be wrong:
+**A7.** Sanity-check the two things most likely to be wrong:
 
 ```bash
 grep -A2 'install:' controlplane.yaml        # expect disk: /dev/nvme0n1
@@ -684,7 +725,7 @@ grep -c 'install:' worker.yaml               # expect 0 — no install section
 grep 'allowSchedulingOnControlPlanes' controlplane.yaml   # expect true
 ```
 
-**A7.** Download the ISO for the NUC (same version and schematic as the workers):
+**A8.** Download the ISO for the NUC (same version and schematic as the workers):
 
 ```bash
 curl -LO https://factory.talos.dev/image/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba/v1.13.6/metal-amd64.iso
@@ -712,7 +753,7 @@ talosctl config node 10.0.2.150
 talosctl -n 10.0.2.150 get disks --insecure
 ```
 
-If the NVMe is not `/dev/nvme0n1`, fix `patches/controlplane.yaml` and re-run **A5**.
+If the NVMe is not `/dev/nvme0n1`, fix `patches/controlplane.yaml` and re-run **A6**.
 
 **B4.** Apply the control-plane config. The node installs to NVMe and reboots.
 
@@ -1014,7 +1055,7 @@ Symptom: after a reboot, nginx logs no `/config/worker.yaml` fetch, but the node
    talosctl -n 10.0.2.151 reset --graceful=false --reboot \
      --system-labels-to-wipe STATE --system-labels-to-wipe EPHEMERAL
    ```
-4. If it keeps installing, accept the fallback: add `machine.install: {disk: /dev/sda}` to `patches/worker.yaml`, regenerate (**A5**), update the Secret (**C4**), and set the BIOS boot order to disk-first / network-fallback. You lose netboot-every-boot; you keep everything else.
+4. If it keeps installing, accept the fallback: add `machine.install: {disk: /dev/sda}` to `patches/worker.yaml`, regenerate (**A6**), update the Secret (**C4**), and set the BIOS boot order to disk-first / network-fallback. You lose netboot-every-boot; you keep everything else.
 
 ### 7.2 Testing whether true zero-disk works
 
@@ -1141,9 +1182,42 @@ The stock install deploys RustFS *in-cluster* as part of the kind overlay. §10.
 
 **You do not need the `siderolabs/gvisor` system extension.** Substrate fetches its own `runsc` binary via `SandboxConfig` and runs it inside the worker pod. Your schematic ID and netboot assets from §4.1 are unchanged — nothing in §3–§7 needs to be redone.
 
-### 10.3 Upgrade Kubernetes to 1.36
+### 10.3 Container registry on the Spark
 
-Talos v1.13.6 ships Kubernetes 1.35, which is one minor behind. Upgrade before installing:
+There are no published Substrate images, so you need a registry the cluster can pull from. Simplest is one on the Spark alongside RustFS.
+
+```bash
+# on the DGX Spark (10.0.2.160)
+sudo mkdir -p /srv/registry
+docker run -d --name registry --restart unless-stopped \
+  -p 5000:5000 -v /srv/registry:/var/lib/registry \
+  registry:3
+```
+
+Talos must be told this registry is plain HTTP. This lives in **`patches/registry-mirror.yaml`**:
+
+```yaml
+---
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+mirrors:
+  10.0.2.160:5000:
+    endpoints:
+      - url: http://10.0.2.160:5000
+```
+
+Append it to both generated configs after running `talosctl gen config` — it is a standalone config document, so a plain concatenation is enough:
+
+```bash
+cat patches/registry-mirror.yaml >> controlplane.yaml
+cat patches/registry-mirror.yaml >> worker.yaml
+```
+
+> `RegistryMirrorConfig` is the current form; the older `machine.registries.mirrors` still works but is deprecated as of Talos 1.12. If you'd rather avoid an insecure registry entirely, push to `ghcr.io` instead and skip this — then `KO_DOCKER_REPO=ghcr.io/<you>` in §10.6 and ensure the images are public or add an imagePullSecret.
+
+### 10.4 Update Talos Configuration
+
+Talos v1.13.6 ships Kubernetes 1.35, which is one minor behind. Upgrade to Kubernetes 1.36 before installing:
 
 ```bash
 talosctl --nodes 10.0.2.150 upgrade-k8s --to 1.36.1
@@ -1181,60 +1255,32 @@ talosctl -n 10.0.2.151 read /proc/sys/user/max_user_namespaces   # 11255
 
 If `clustertrustbundles` is missing, stop. The Substrate install will hang forever at "Waiting for podcertificate ClusterTrustBundles to be ready".
 
-### 10.4 Container registry on the Spark
-
-There are no published Substrate images, so you need a registry the cluster can pull from. Simplest is one on the Spark alongside RustFS.
-
-```bash
-# on the DGX Spark (10.0.2.160)
-sudo mkdir -p /srv/registry
-docker run -d --name registry --restart unless-stopped \
-  -p 5000:5000 -v /srv/registry:/var/lib/registry \
-  registry:3
-```
-
-Talos must be told this registry is plain HTTP. This lives in **`patches/registry-mirror.yaml`**:
-
-```yaml
----
-apiVersion: v1alpha1
-kind: RegistryMirrorConfig
-mirrors:
-  10.0.2.160:5000:
-    endpoints:
-      - url: http://10.0.2.160:5000
-        overridePath: true
-```
-
-Append it to both generated configs after running `talosctl gen config` — it is a standalone config document, so a plain concatenation is enough:
-
-```bash
-cat patches/registry-mirror.yaml >> controlplane.yaml
-cat patches/registry-mirror.yaml >> worker.yaml
-```
-
-> `RegistryMirrorConfig` is the current form; the older `machine.registries.mirrors` still works but is deprecated as of Talos 1.12. If you'd rather avoid an insecure registry entirely, push to `ghcr.io` instead and skip this — then `KO_DOCKER_REPO=ghcr.io/<you>` in §10.6 and ensure the images are public or add an imagePullSecret.
-
 ### 10.5 RustFS on the DGX Spark
 
 The Spark is arm64 (GB10, 20-core Arm) running DGX OS — Ubuntu 24.04. RustFS publishes arm64 images, so this is a straight `docker run`.
 
 ```bash
 # on the DGX Spark
-sudo mkdir -p /srv/rustfs/{data,logs}
+sudo mkdir -p /srv/rustfs/logs
 sudo chown -R 10001:10001 /srv/rustfs      # container runs as UID/GID 10001
 
-docker run -d --name rustfs --restart unless-stopped \
-  -p 9000:9000 -p 9001:9001 \
-  -v /srv/rustfs/data:/data \
+docker volume create rustfs-data
+
+docker run -d \
+  --name rustfs \
+  --restart unless-stopped  \
+  -p 9000:9000 \
+  -p 9001:9001 \
+  -v rustfs-data:/data \
   -v /srv/rustfs/logs:/logs \
+  -e RUSTFS_ACCESS_KEY="substrate" \
+  -e RUSTFS_SECRET_KEY_FILE=./rustfs_secret_key \ # pick up the secret from a local file
   -e RUSTFS_ADDRESS=":9000" \
   -e RUSTFS_CONSOLE_ADDRESS=":9001" \
-  -e RUSTFS_CONSOLE_ENABLE="true" \
-  -e RUSTFS_VOLUMES="/data" \
-  -e RUSTFS_ACCESS_KEY="substrate" \
-  -e RUSTFS_SECRET_KEY="<a real password>" \
-  rustfs/rustfs:1.0.0-beta.3
+  -e RUSTFS_CONSOLE_ENABLE=true \
+  -e RUSTFS_OBS_LOGGER_LEVEL=error \
+  rustfs/rustfs:1.0.0-beta.3 \
+  /data
 ```
 
 > Pin the tag. Substrate's own manifest pins `rustfs/rustfs:1.0.0-beta.3@sha256:378642b0...` — matching their tested version is the safer choice on a beta storage engine. And change the credentials: the upstream default is `rustfsadmin`/`rustfsadmin`, which is fine inside a kind cluster and not fine on your LAN.

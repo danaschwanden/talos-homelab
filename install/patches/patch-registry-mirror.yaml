@@ -1,0 +1,7 @@
+---
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+name: '*'
+# List of mirror endpoints for the registry.
+endpoints:
+    - url: http://10.0.1.50:5000
