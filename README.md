@@ -36,7 +36,7 @@
           |                                                   |
           v                                                   v
 +----------------------+                           +----------------------+
-| cp-01                |                           | dgx-spark            |
+| cp-00                |                           | dgx-spark            |
 | 10.0.2.150           |                           | 10.0.2.160           |
 | control plane        |                           | snapshot store       |
 | netboot server       |                           +----------------------+
@@ -107,7 +107,7 @@ If netboot-every-boot turns out to be flaky in your environment, the fallback is
 
 | Hostname | Hardware | IP | Role | Boots from |
 |---|---|---|---|---|
-| `cp-01` | Intel NUC10FNH | `10.0.2.150` | control plane + netboot stack (+ §10 Substrate control plane, Valkey) | NVMe, installed |
+| `cp-00` | Intel NUC10FNH | `10.0.2.150` | control plane + netboot stack (+ §10 Substrate control plane, Valkey) | NVMe, installed |
 | `wn-01` | Protectli FW2B | `10.0.2.151` | worker | network, every boot |
 | `wn-02` | Protectli FW2B | `10.0.2.152` | worker | network, every boot |
 | `wn-03` | Protectli FW2B | `10.0.2.153` | worker | network, every boot |
@@ -138,7 +138,7 @@ grep -rl '10\.0\.2\.' . | xargs sed -i '' 's/10\.0\.2\./192.168.7./g'   # macOS
 ### 3.3 Router preparation — do this before anything else
 
 1. Create **DHCP reservations** for all four MACs at the IPs above.
-2. Set the **hostname** in each reservation: `cp-01`, `wn-01`, `wn-02`, `wn-03`, `wn-04`. Talos picks up the DHCP-supplied hostname (option 12), which is why no hostname appears in any machine config below and why all four workers can share one config file.
+2. Set the **hostname** in each reservation: `cp-00`, `wn-01`, `wn-02`, `wn-03`, `wn-04`. Talos picks up the DHCP-supplied hostname (option 12), which is why no hostname appears in any machine config below and why all four workers can share one config file.
 3. **Verify the router is NOT sending PXE options.** Check that DHCP options 66 (`next-server`) and 67 (`filename`) are unset. Two DHCP servers offering boot files produces intermittent, maddening failures.
 
 ### 3.4 Workstation tooling
@@ -772,7 +772,7 @@ talosctl -n 10.0.2.150 bootstrap
 ```bash
 talosctl -n 10.0.2.150 kubeconfig ./kubeconfig
 export KUBECONFIG=$PWD/kubeconfig
-kubectl get nodes -o wide     # cp-01 Ready (may take a few minutes)
+kubectl get nodes -o wide     # cp-00 Ready (may take a few minutes)
 ```
 
 **B7.** **Discover the NUC's interface name** — you need it for dnsmasq:
@@ -981,7 +981,7 @@ kubectl get nodes -o wide
 talosctl -n 10.0.2.150 health --wait-timeout 10m
 ```
 
-Expect five nodes `Ready`: `cp-01` (control-plane) and `wn-01`/`02`/`03`/`04`.
+Expect five nodes `Ready`: `cp-00` (control-plane) and `wn-01`/`02`/`03`/`04`.
 
 **F3.** Commit the repo — **without** the files listed in §4.11.
 
