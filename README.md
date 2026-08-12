@@ -221,6 +221,7 @@ cluster:
   allowSchedulingOnControlPlanes: true
   apiServer:
     extraArgs:
+      anonymous-auth: "true"
       feature-gates: "ClusterTrustBundle=true,ClusterTrustBundleProjection=true,PodCertificateRequest=true"
       runtime-config: "certificates.k8s.io/v1beta1=true"
   controllerManager:
@@ -1550,6 +1551,9 @@ spec:
     # THE important line. Never let the NUC into this pool — see §2.
     nodeSelector:
       hardware: fw2b
+    securityContext:
+      seccompProfile:
+        type: Unconfined
     resources:
       requests:
         cpu: 200m

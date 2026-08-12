@@ -23,6 +23,9 @@ spec:
     # THE important line. Never let the NUC into this pool — see §2.
     nodeSelector:
       hardware: fw2b
+    securityContext:
+      seccompProfile:
+        type: Unconfined
     resources:
       requests:
         cpu: 200m
