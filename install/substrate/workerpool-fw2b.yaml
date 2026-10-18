@@ -1,7 +1,11 @@
+# One Worker per FW2B, sized for a Claude Code-class Actor (2Gi, 1 CPU).
+# Applied with ko so the ko:// worker image resolves:
+#
+#   hack/run-tool.sh ko apply -f <this file>    (from the substrate checkout)
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: ate-demo
+  name: homelab
   labels:
     pod-security.kubernetes.io/enforce: privileged
     pod-security.kubernetes.io/audit: privileged
@@ -10,26 +14,30 @@ metadata:
 apiVersion: ate.dev/v1alpha1
 kind: WorkerPool
 metadata:
-  name: fw2b-pool
-  namespace: ate-demo
+  name: fw2b
+  namespace: homelab
   labels:
+    # ActorTemplates select Workers by this label (workerSelector).
     workload: homelab
 spec:
-  # 4 nodes × 2 warm pods. Each worker pod holds a gVisor sandbox in RAM.
-  replicas: 8
-  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
-  sandboxClass: gvisor
+  replicas: 4
+  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-gvisor
+  # No configRef: follows the gvisor class default (gvisor-default as installed).
+  sandboxClasses:
+  - name: gvisor
   template:
-    # THE important line. Never let the NUC into this pool — see §2.
+    # Placement, not safety: upstream refuses to restore a Snapshot onto a
+    # Worker with fewer CPU features, so a Snapshot taken on the NUC would
+    # leave its Actor stuck on the NUC. Keeping Workers on the FW2Bs keeps
+    # every Actor movable across all four.
     nodeSelector:
       hardware: fw2b
-    securityContext:
-      seccompProfile:
-        type: Unconfined
+    # Limits advertise the Worker's capacity (the most one Actor may ask for).
+    # Memory is not compressible, so its request equals the limit.
     resources:
       requests:
-        cpu: 200m
-        memory: 512Mi
+        cpu: 500m
+        memory: 3Gi
       limits:
-        cpu: "1"
-        memory: 1500Mi
+        cpu: 1500m
+        memory: 3Gi

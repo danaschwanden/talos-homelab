@@ -17,8 +17,8 @@
 | **DHCP** | your existing router keeps serving leases; the NUC only adds PXE options |
 | **Worker state** | mSATA holds STATE + EPHEMERAL only — no bootloader, no install |
 | **Config server security** | source-IP allowlist + access logging on `/config/` |
-| **Agent Substrate** (§10) | control plane + Valkey on the NUC; WorkerPool pinned to FW2Bs only |
-| **Snapshot store** (§10) | RustFS on the DGX Spark, reached over S3 |
+| **Agent Substrate** (§10) | control plane on the NUC; one Worker per FW2B |
+| **Substrate state** (§10) | PostgreSQL + RustFS snapshot store + image registry on the DGX Spark |
 
 **Not HA.** One control plane means no etcd quorum. If the NUC is down, the Kubernetes API is down and no worker can boot. That is an accepted tradeoff of this design, not an oversight — see §8.
 
@@ -72,9 +72,9 @@
 
 The NUC is Comet Lake (AVX, AVX2, BMI). The FW2Bs are Airmont — **SSE4.2 and nothing above it, no AVX at all.** That is close to the widest CPU feature gap two x86 machines can have.
 
-It doesn't matter for plain Kubernetes. It matters enormously for Agent Substrate, because gVisor checkpoint images capture CPU feature state and **a snapshot taken on a machine with more features will not restore on one with fewer** ([google/gvisor#11486](https://github.com/google/gvisor/issues/11486)). A golden snapshot taken on the NUC will fail to restore on a FW2B, intermittently and with confusing errors.
+It doesn't matter for plain Kubernetes. It matters for Agent Substrate, because gVisor snapshots capture CPU feature state and **a Snapshot taken on a machine with more features can't restore on one with fewer** ([google/gvisor#11486](https://github.com/google/gvisor/issues/11486)). Upstream now guards against this: each Snapshot records a `cpu_features` mask, and Substrate only restores it onto a Worker whose features are a superset. So a NUC Snapshot is refused on a FW2B cleanly, rather than failing intermittently.
 
-The fix is to keep every Substrate WorkerPool pinned to a single homogeneous node set. §10 does this with `nodeSelector: hardware: fw2b`, which is why the `hardware: fw2b` node label in §4.3 is load-bearing and not cosmetic. **Never add the NUC to a WorkerPool, and re-baseline every ActorTemplate if you ever add a node of a different vintage.**
+That makes the pin a placement rule rather than a safety rule. An Actor snapshotted on the NUC could only ever come back on the NUC. §10 keeps every Worker on the FW2Bs with `nodeSelector: hardware: fw2b`, which is why the `hardware: fw2b` node label in §4.3 is load-bearing and not cosmetic. **Don't add the NUC to a WorkerPool. If you ever add a Node of a different vintage, give it its own WorkerPool.**
 
 ### The "diskless" caveat
 
@@ -107,12 +107,12 @@ If netboot-every-boot turns out to be flaky in your environment, the fallback is
 
 | Hostname | Hardware | IP | Role | Boots from |
 |---|---|---|---|---|
-| `cp-00` | Intel NUC10FNH | `10.0.2.150` | control plane + netboot stack (+ §10 Substrate control plane, Valkey) | NVMe, installed |
+| `cp-00` | Intel NUC10FNH | `10.0.2.150` | control plane + netboot stack (+ §10 Substrate control plane) | NVMe, installed |
 | `wn-01` | Protectli FW2B | `10.0.2.151` | worker | network, every boot |
 | `wn-02` | Protectli FW2B | `10.0.2.152` | worker | network, every boot |
 | `wn-03` | Protectli FW2B | `10.0.2.153` | worker | network, every boot |
 | `wn-04` | Protectli FW2B | `10.0.2.154` | worker | network, every boot |
-| — | NVIDIA DGX Spark | `10.0.2.160` | §10 only: RustFS + image registry. **Not a cluster node.** | its own disk |
+| — | NVIDIA DGX Spark | `10.0.2.160` | §10 only: PostgreSQL, RustFS, image registry. **Not a cluster node.** | its own disk |
 
 Gateway / router: `10.0.2.1`. Subnet: `10.0.2.0/24`.
 
@@ -133,7 +133,7 @@ grep -rl '10\.0\.2\.' . | xargs sed -i '' 's/10\.0\.2\./192.168.7./g'   # macOS
 | Workers | `10.0.2.151`–`10.0.2.154` | `nginx.conf` allowlist |
 | NUC interface | `ENP_PLACEHOLDER` | `dnsmasq.conf` — replaced in step **C1** |
 | NUC install disk | `/dev/nvme0n1` | `patches/controlplane.yaml` — verified in step **B3** |
-| DGX Spark | `10.0.2.160` | §10 only — RustFS, registry |
+| DGX Spark | `10.0.2.160` | §10 only — PostgreSQL, RustFS, registry |
 
 ### 3.3 Router preparation — do this before anything else
 
@@ -168,7 +168,8 @@ talos-homelab/
 │   │   └── local-path-provisioner.yaml
 │   ├── worker.yaml
 │   ├── patch-hostname.yaml
-│   └── patch-registry-mirror.yaml          # §10 only
+│   ├── controlplane-substrate-label.yaml   # §10 only
+│   └── trusted-roots.yaml                  # §10 only, generated
 ├── k8s/
 │   ├── 00-namespace.yaml
 │   ├── 10-cm-dnsmasq.yaml
@@ -177,11 +178,7 @@ talos-homelab/
 │   ├── 20-job-fetch-assets.yaml
 │   ├── 30-deploy-dnsmasq.yaml
 │   └── 31-deploy-nginx.yaml
-└── substrate/                           # §10 only
-    ├── ate-demo-counter.yaml 
-    ├── manifests/ate-install/homelab/
-    │   └── kustomization.yaml        # copy into your substrate checkoutworkerpool-fw2b.yaml
-    └── sandboxconfig-gvisor-homelab.yaml
+└── substrate/                           # §10 only — see substrate/README.md
 ```
 
 `talosctl gen config` will later add `controlplane.yaml`, `worker.yaml`, `secrets.yaml`, and `talosconfig` at the root. **Those four contain secrets — see §4.11 before committing anything to git.**
@@ -1144,519 +1141,48 @@ HTTPS is deliberately not on that list: the URL is published in plaintext inside
 
 If you take on §10, add these:
 
-7. **CPU-heterogeneous checkpoint/restore.** A gVisor snapshot from the NUC will not restore on a FW2B. Mitigated only by the `nodeSelector` in §10.10 — there is no runtime guard. See §2.
-8. **Substrate is pre-release.** `v0.0.0`, no published images, APIs expected to change, GKE-shaped install path. Every upgrade is a rebuild from source.
-9. **Snapshots are the sole copy of actor state**, on a beta single-node object store on one box. §10.14.
-10. **1GbE bounds activation latency.** RAM images over the wire; seconds, not milliseconds. §10.13.
+7. **The Spark is a single point of failure for all Actor state.** PostgreSQL (which Actors exist, and which Snapshot is current for each) and RustFS (the Snapshots themselves) both live on one host, on a beta object store. Back up Postgres, RustFS and `/srv/spark-ca` *together*: a database that doesn't match the bucket orphans Snapshots or points Actors at missing ones. Backups are a follow-up. See [ADR 0001](docs/adr/0001-substrate-state-on-the-spark.md).
+8. **Substrate tracks upstream `main`.** There are no published images, and manifests, field names and image paths change often. Every install is a rebuild from source. `install/substrate/README.md` records the last verified upstream commit.
+9. **1GbE bounds activation latency.** Memory Snapshots travel over the wire: a 2Gi Actor is about 20 seconds each way. Resume takes seconds, not milliseconds.
+10. **NetworkPolicies are not enforced.** Flannel (the Talos default network plugin) ignores them, so upstream's default-deny ingress policies in `ate-system` have no effect. Actor isolation still relies on gVisor and on Substrate's own mTLS between components. Switching to a network plugin that enforces NetworkPolicies is out of scope here.
+11. **Upstream changes the external database's requirements.** `ate-setup` never migrates roles or grants on the Spark. Re-check upstream's `docs/postgres.md` after pulling `main`.
 
 ---
 
-## 10. Agent Substrate + RustFS
+## 10. Agent Substrate
 
 Everything in this section is optional and independent of §1–§9. Do it only after §6 passes.
 
-> **Maturity warning, stated once.** Agent Substrate self-describes as "VERY early development... APIs are almost guaranteed to change." Its only release is `v0.0.0 - initial commit`. There are **no published container images** — every component is a `ko://` reference built from source. The non-kind install path assumes GKE, GCS, and Memorystore; you are porting it to bare metal. RustFS is at `1.0.0-beta`. Treat this as an experiment you can rebuild, not infrastructure you depend on.
+[Agent Substrate](https://github.com/agent-substrate/substrate) multiplexes many mostly idle, stateful **Actors** (agents) onto a few warm, gVisor-sandboxed **Workers**. It snapshots idle Actors to object storage and resumes them on demand on any compatible Worker. Here:
 
-### 10.1 Placement
+- **The Substrate control plane** runs on `cp-00`, pinned by the `ate.dev/workloadType=ate-control-plane` label.
+- **One Worker per FW2B** (4 in total), sized for a Claude Code-class Actor.
+- **The state store (PostgreSQL), the snapshot store (RustFS) and the image registry** run on the DGX Spark, outside the cluster ([ADR 0001](docs/adr/0001-substrate-state-on-the-spark.md)).
 
-| Component | Where | Why |
-|---|---|---|
-| `ate-api-server`, `ate-controller`, `atenet-router`, `atenet-dns` | **NUC** (control plane) | Control-plane latency, and the FW2Bs have no spare cores |
-| `valkey-cluster` (StatefulSet) | **NUC** | Actor registry; needs a real disk. **Substrate deploys this itself** — you don't install Valkey separately, you pin the StatefulSet it creates |
-| `podcertificate-controller` | **NUC** | Signs pod certs for the mTLS mesh |
-| `atelet` (DaemonSet) | **all nodes** | Node agent; does snapshot I/O. Leave it unpinned |
-| Worker pods / actors | **FW2Bs only** | Enforced by `nodeSelector: hardware: fw2b` — see §2 |
-| **RustFS** | **DGX Spark**, outside the cluster | 4 TB NVMe, and keeps snapshot state off disposable workers |
+**The full runbook is [`install/substrate/README.md`](install/substrate/README.md).** It tracks upstream `main` and records the commit it was last verified against.
 
-The stock install deploys RustFS *in-cluster* as part of the kind overlay. §10.5 replaces that with the Spark.
+Prerequisites already in this runbook:
 
-### 10.2 Prerequisites
-
-| Requirement | Where it's handled |
+| Requirement | Where |
 |---|---|
-| Kubernetes ≥ 1.36 | §10.3 — Substrate supports latest stable and one minor back |
-| `ClusterTrustBundle`, `ClusterTrustBundleProjection`, `PodCertificateRequest` gates + `certificates.k8s.io/v1beta1` | §4.2 (control plane) and §4.3 (kubelet) |
-| `user.max_user_namespaces`, `net.ipv4.conf.all.proxy_arp` | §4.3 (workers) |
-| A container registry the cluster can pull from | §10.4 |
-| RustFS reachable over S3 | §10.5 |
-| Go, `ko`, `kustomize`, `jq`, `docker` on your workstation | §10.6 |
+| `ClusterTrustBundle`, `ClusterTrustBundleProjection`, `PodCertificateRequest` gates and `certificates.k8s.io/v1beta1` (Kubernetes 1.36) | §4.2, §4.3 |
+| `user.max_user_namespaces`, `net.ipv4.conf.all.proxy_arp` on the workers | §4.3 |
+| `hardware: fw2b` label on the workers | §4.3 |
+
+What the Substrate runbook adds to the Talos configs:
+- the Spark CA, as a `TrustedRootsConfig` on every Node;
+- the control-plane label on `cp-00`.
+
+Its risks are §9 items 7–11.
+
+**Follow-ups, not yet done:**
+- Talos 1.14 + Kubernetes 1.37, then remove the feature gates and `runtime-config` (Talos 1.13 supports at most Kubernetes 1.36).
+- `ingressAuthMode: static-mtls` once an in-cluster caller exists.
+- Real `ateapi.authz.bootstrapOwners` instead of the shared `ate-client` ServiceAccount.
+- Spark backups: Postgres, RustFS and `/srv/spark-ca` together, copied to a second machine, with a restore test.
+- Observability: an OTel collector and Prometheus on `cp-00`.
+- A Claude Code ActorTemplate with an egress credential grant for its API key.
 
-**You do not need the `siderolabs/gvisor` system extension.** Substrate fetches its own `runsc` binary via `SandboxConfig` and runs it inside the worker pod. Your schematic ID and netboot assets from §4.1 are unchanged — nothing in §3–§7 needs to be redone.
-
-### 10.3 Container registry on the Spark
-
-There are no published Substrate images, so you need a registry the cluster can pull from. Simplest is one on the Spark alongside RustFS.
-
-```bash
-# on the DGX Spark (10.0.2.160)
-sudo mkdir -p /srv/registry
-docker run -d --name registry --restart unless-stopped \
-  -p 5000:5000 -v /srv/registry:/var/lib/registry \
-  registry:3
-```
-
-Talos must be told this registry is plain HTTP. This lives in **`patches/registry-mirror.yaml`**:
-
-```yaml
----
-apiVersion: v1alpha1
-kind: RegistryMirrorConfig
-mirrors:
-  10.0.2.160:5000:
-    endpoints:
-      - url: http://10.0.2.160:5000
-```
-
-Append it to both generated configs after running `talosctl gen config` — it is a standalone config document, so a plain concatenation is enough:
-
-```bash
-cat patches/registry-mirror.yaml >> controlplane.yaml
-cat patches/registry-mirror.yaml >> worker.yaml
-```
-
-> `RegistryMirrorConfig` is the current form; the older `machine.registries.mirrors` still works but is deprecated as of Talos 1.12. If you'd rather avoid an insecure registry entirely, push to `ghcr.io` instead and skip this — then `KO_DOCKER_REPO=ghcr.io/<you>` in §10.6 and ensure the images are public or add an imagePullSecret.
-
-### 10.4 Update Talos Configuration
-
-Talos v1.13.6 ships Kubernetes 1.35, which is one minor behind. Upgrade to Kubernetes 1.36 before installing:
-
-```bash
-talosctl --nodes 10.0.2.150 upgrade-k8s --to 1.36.1
-kubectl version
-kubectl get nodes -o wide     # all four still Ready
-```
-
-Then apply the §4.2/§4.3 patches if you haven't already:
-
-```bash
-# regenerate with the new patches
-talosctl gen config homelab https://10.0.2.150:6443 \
-  --with-secrets secrets.yaml \
-  --config-patch-control-plane @patches/controlplane.yaml \
-  --config-patch-worker @patches/worker.yaml \
-  --with-docs=false --with-examples=false --output-dir . --force
-
-talosctl -n 10.0.2.150 apply-config -f controlplane.yaml
-
-# workers pick the new config up on next boot — refresh the served copy first
-kubectl -n netboot create secret generic machine-config \
-  --from-file=worker.yaml=./worker.yaml \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-for ip in 10.0.2.151 10.0.2.152 10.0.2.153 10.0.2.154; do talosctl -n $ip reboot; sleep 120; done
-```
-
-Verify the gates actually took:
-
-```bash
-kubectl api-resources | grep -i clustertrustbundle    # must return rows
-kubectl get --raw /apis/certificates.k8s.io/v1beta1 | jq -r '.resources[].name'
-talosctl -n 10.0.2.151 read /proc/sys/user/max_user_namespaces   # 11255
-```
-
-If `clustertrustbundles` is missing, stop. The Substrate install will hang forever at "Waiting for podcertificate ClusterTrustBundles to be ready".
-
-### 10.5 RustFS on the DGX Spark
-
-The Spark is arm64 (GB10, 20-core Arm) running DGX OS — Ubuntu 24.04. RustFS publishes arm64 images, so this is a straight `docker run`.
-
-```bash
-# on the DGX Spark
-sudo mkdir -p /srv/rustfs/logs
-sudo chown -R 10001:10001 /srv/rustfs      # container runs as UID/GID 10001
-
-docker volume create rustfs-data
-
-docker run -d \
-  --name rustfs \
-  --restart unless-stopped  \
-  -p 9000:9000 \
-  -p 9001:9001 \
-  -v rustfs-data:/data \
-  -v /srv/rustfs/logs:/logs \
-  -e RUSTFS_ACCESS_KEY="substrate" \
-  -e RUSTFS_SECRET_KEY_FILE=./rustfs_secret_key \ # pick up the secret from a local file
-  -e RUSTFS_ADDRESS=":9000" \
-  -e RUSTFS_CONSOLE_ADDRESS=":9001" \
-  -e RUSTFS_CONSOLE_ENABLE=true \
-  -e RUSTFS_OBS_LOGGER_LEVEL=error \
-  rustfs/rustfs:1.0.0-beta.3 \
-  /data
-```
-
-> Pin the tag. Substrate's own manifest pins `rustfs/rustfs:1.0.0-beta.3@sha256:378642b0...` — matching their tested version is the safer choice on a beta storage engine. And change the credentials: the upstream default is `rustfsadmin`/`rustfsadmin`, which is fine inside a kind cluster and not fine on your LAN.
-
-Create the bucket:
-
-```bash
-# from your workstation, with awscli installed
-export AWS_ACCESS_KEY_ID=substrate
-export AWS_SECRET_ACCESS_KEY='<a real password>'
-export AWS_REGION=us-east-1
-aws --endpoint-url http://10.0.2.160:9000 s3api create-bucket --bucket ate-snapshots
-aws --endpoint-url http://10.0.2.160:9000 s3 ls
-```
-
-Store the credentials as a Secret rather than inlining them the way upstream does (their manifest carries a `TODO: use a secret / identity management`):
-
-```bash
-kubectl create namespace ate-system --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n ate-system create secret generic rustfs-credentials \
-  --from-literal=AWS_ACCESS_KEY_ID=substrate \
-  --from-literal=AWS_SECRET_ACCESS_KEY='<a real password>'
-```
-
-### 10.6 Build and push the Substrate images
-
-```bash
-git clone https://github.com/agent-substrate/substrate.git
-cd substrate
-
-export KO_DOCKER_REPO=10.0.2.160:5000
-export KO_DEFAULTPLATFORMS=linux/amd64      # all four cluster nodes are amd64
-export NO_DEV_ENV=true
-export BUCKET_NAME=ate-snapshots
-```
-
-`KO_DEFAULTPLATFORMS=linux/amd64` matters: the Spark is arm64, so `ko` would otherwise build for the wrong architecture if it inferred from the host. Build on an amd64 workstation, or set this explicitly.
-
-### 10.7 The `homelab` kustomize overlay
-
-Upstream ships two overlays: `manifests/ate-install` (GKE) and `manifests/ate-install/kind`. Neither fits — the GKE one wants GCS, the kind one deploys RustFS in-cluster. Create a third in your checkout:
-
-**`manifests/ate-install/homelab/kustomization.yaml`**
-
-```yaml
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-  - ../ate-api-server.yaml
-  - ../ate-controller.yaml
-  - ../atelet.yaml
-  - ../atenet-dns.yaml
-  - ../atenet-router.yaml
-  - ../valkey.yaml
-  - ../pod-certificate-controller.yaml
-  # NOTE: no rustfs.yaml — RustFS lives on the Spark (§10.5)
-  # NOTE: no otel-collector / prometheus — add later if you want them
-
-patches:
-  # ---- atelet: point snapshot storage at RustFS on the Spark ----
-  - patch: |-
-      apiVersion: apps/v1
-      kind: DaemonSet
-      metadata:
-        name: atelet
-        namespace: ate-system
-      spec:
-        template:
-          spec:
-            containers:
-            - name: atelet
-              args:
-              - --gcp-auth-for-image-pulls=false
-              - --grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
-              - --client-ca-certs=/run/podidentity.podcert.ate.dev/trust-bundle.pem
-              env:
-              - name: ATE_STORAGE_BACKEND
-                value: s3
-              - name: AWS_REGION
-                value: us-east-1
-              - name: AWS_ENDPOINT_URL
-                value: http://10.0.2.160:9000
-              - name: AWS_S3_USE_PATH_STYLE
-                value: "true"
-              - name: AWS_ACCESS_KEY_ID
-                valueFrom:
-                  secretKeyRef:
-                    name: rustfs-credentials
-                    key: AWS_ACCESS_KEY_ID
-              - name: AWS_SECRET_ACCESS_KEY
-                valueFrom:
-                  secretKeyRef:
-                    name: rustfs-credentials
-                    key: AWS_SECRET_ACCESS_KEY
-              - name: OTEL_EXPORTER_OTLP_ENDPOINT
-                value: ""
-
-  # ---- Valkey pinned to the NUC ----
-  - patch: |-
-      apiVersion: apps/v1
-      kind: StatefulSet
-      metadata:
-        name: valkey-cluster
-        namespace: ate-system
-      spec:
-        template:
-          spec:
-            nodeSelector:
-              node-role.kubernetes.io/control-plane: ""
-
-  # ---- control-plane components pinned to the NUC ----
-  - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: ate-api-server
-        namespace: ate-system
-      spec:
-        template:
-          spec:
-            nodeSelector:
-              node-role.kubernetes.io/control-plane: ""
-  - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: ate-controller
-        namespace: ate-system
-      spec:
-        template:
-          spec:
-            nodeSelector:
-              node-role.kubernetes.io/control-plane: ""
-  - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: atenet-router
-        namespace: ate-system
-      spec:
-        template:
-          spec:
-            nodeSelector:
-              node-role.kubernetes.io/control-plane: ""
-  - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: dns
-        namespace: ate-system
-      spec:
-        template:
-          spec:
-            nodeSelector:
-              node-role.kubernetes.io/control-plane: ""
-```
-
-> ⚠️ **The `gs://` scheme is a red herring.** Snapshot locations in `ActorTemplate.snapshotsConfig.location` are written as `gs://<bucket>/<path>/` **even when the backend is S3** — upstream's own kind demos do exactly this while writing to RustFS. The backend is chosen by `ATE_STORAGE_BACKEND` on atelet, not by the URL scheme. Do not "fix" it to `s3://`.
-
-### 10.8 SandboxConfig — the `runsc` binary
-
-`deploy_ate_system` applies a cluster default `SandboxConfig` named `gvisor-default`, whose assets point at gVisor nightly builds on Google Cloud Storage. Check what scheme it uses:
-
-```bash
-kubectl get sandboxconfig gvisor-default -o yaml
-```
-
-If the `url` is `gs://...` and your cluster has no GCP credentials, override it with the public HTTPS equivalent (**`substrate/sandboxconfig-gvisor-homelab.yaml`**):
-
-```yaml
-apiVersion: ate.dev/v1alpha1
-kind: SandboxConfig
-metadata:
-  name: gvisor-homelab
-spec:
-  sandboxClass: gvisor
-  default: true
-  assets:
-    amd64:
-      runsc:
-        url: "https://storage.googleapis.com/gvisor/releases/nightly/2026-05-19/x86_64/runsc"
-        sha256: "a397be1abc2420d26bce6c70e6e2ff96c73aaaab929756c56f5e2089ea842b63"
-```
-
-Set `default: false` on `gvisor-default` first — at most one default is allowed per `sandboxClass`, and a `ValidatingAdmissionPolicy` enforces it. Verify the sha256 against whatever release you actually point at; the digest above is the one in upstream's example and is version-specific.
-
-### 10.9 Install
-
-```bash
-cd substrate
-export KUBECONFIG=/path/to/kubeconfig
-
-# 1. CRDs and the SandboxConfig validation policy
-./hack/run-tool.sh ko apply -f manifests/ate-install/generated
-kubectl apply -f manifests/ate-install/sandboxconfig-validation.yaml
-kubectl apply -f manifests/ate-install/sandboxconfig-gvisor.yaml
-
-# 2. Namespace — confirm it carries PSA privileged labels; add them if not
-kubectl apply -f manifests/ate-install/ate-system-namespace.yaml
-kubectl get ns ate-system --show-labels
-kubectl label ns ate-system \
-  pod-security.kubernetes.io/enforce=privileged \
-  pod-security.kubernetes.io/audit=privileged \
-  pod-security.kubernetes.io/warn=privileged --overwrite
-
-# 3. RustFS credentials (§10.5) must exist before atelet starts
-kubectl -n ate-system get secret rustfs-credentials
-
-# 4. CAs, JWT pools, apiserver env — reuse upstream's helpers
-./hack/install-ate.sh --create-podcertificate-controller-cas
-./hack/install-ate.sh --create-jwt-authority-pool-secret
-./hack/install-ate.sh --create-session-id-ca-pool-secret
-
-# 5. podcertificate-controller, then wait for the trust bundles
-./hack/run-tool.sh ko apply -f manifests/ate-install/pod-certificate-controller.yaml
-kubectl rollout status deployment/podcertificate-controller -n podcertificate-controller-system --timeout=120s
-kubectl get clustertrustbundles
-
-# 6. Valkey CA certs (depends on step 5 having produced the CA pools)
-./hack/install-ate.sh --create-valkey-ca-certs-secret
-./hack/install-ate.sh --create-api-server-env-vars
-
-# 7. The system itself, through the homelab overlay
-talosctl --nodes 10.0.2.150 patch mc --patch @install/patches/local-path-provisioner/local-path-provisioner.yaml
-kubectl kustomize manifests/ate-install/homelab --load-restrictor LoadRestrictionsNone \
-  | ./hack/run-tool.sh ko resolve -f - \
-  | kubectl apply -f -
-
-# 8. Wait
-kubectl rollout status deployment/ate-api-server  -n ate-system --timeout=300s
-kubectl rollout status deployment/ate-controller  -n ate-system --timeout=300s
-kubectl rollout status deployment/atenet-router   -n ate-system --timeout=300s
-kubectl rollout status statefulset/valkey-cluster -n ate-system --timeout=300s
-kubectl rollout status daemonset/atelet           -n ate-system --timeout=300s
-```
-
-Step 5 is the one that hangs if §10.3 didn't take. If `kubectl get clustertrustbundles` returns `the server doesn't have a resource type`, go back and fix the feature gates.
-
-### 10.10 WorkerPool — FW2B only
-
-This is the piece that keeps §2's CPU problem from biting you. File: **`substrate/workerpool-fw2b.yaml`**.
-
-```yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ate-demo
-  labels:
-    pod-security.kubernetes.io/enforce: privileged
-    pod-security.kubernetes.io/audit: privileged
-    pod-security.kubernetes.io/warn: privileged
----
-apiVersion: ate.dev/v1alpha1
-kind: WorkerPool
-metadata:
-  name: fw2b-pool
-  namespace: ate-demo
-  labels:
-    workload: homelab
-spec:
-  # 4 nodes × 2 warm pods. Each worker pod holds a gVisor sandbox in RAM.
-  replicas: 8
-  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
-  sandboxClass: gvisor
-  template:
-    # THE important line. Never let the NUC into this pool — see §2.
-    nodeSelector:
-      hardware: fw2b
-    securityContext:
-      seccompProfile:
-        type: Unconfined
-    resources:
-      requests:
-        cpu: 200m
-        memory: 512Mi
-      limits:
-        cpu: "1"
-        memory: 1500Mi
-```
-
-Sizing rationale for an 8 GB / 2-core FW2B: Talos plus kubelet takes ~1–1.5 GB, and `systemReserved`/`evictionHard` from §4.3 hold back another ~750 MB. That leaves roughly 5.5–6 GB per node. Two worker pods at a 1.5 GB limit is ~3 GB, which leaves headroom for atelet, the CNI, and actor filesystem cache. Across four FW2Bs that's 8 warm pods. Raise `replicas` only after watching real memory under load.
-
-### 10.11 ActorTemplate
-
-File: **`substrate/ate-demo-counter.yaml`**.
-
-```yaml
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
-metadata:
-  name: counter
-  namespace: ate-demo
-spec:
-  sandboxClass: gvisor
-  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
-  containers:
-  - name: counter
-    image: ko://github.com/agent-substrate/substrate/demos/counter
-    command:
-    - /ko-app/counter
-    readyz:
-      httpGet:
-        path: /readyz
-        port: 80
-    volumeMounts:
-    - name: data
-      mountPath: /home/counter
-  workerSelector:
-    matchLabels:
-      workload: homelab          # must match the WorkerPool's labels
-  snapshotsConfig:
-    onPause: Full
-    onCommit: Data
-    location: gs://ate-snapshots/ate-demo-counter/     # gs:// — see §10.7
-  volumes:
-  - name: data
-    durableDir: {}
-```
-
-Apply it through `ko` so the `ko://` reference resolves:
-
-```bash
-./hack/run-tool.sh ko apply -f <path-to>/substrate/ate-demo-counter.yaml
-kubectl -n ate-demo get actortemplate counter -o jsonpath='{.status.phase}'   # want: Ready
-```
-
-The golden snapshot is taken on whichever worker the golden pod lands on — which, thanks to the `nodeSelector`, is always a FW2B. That's the invariant that makes restores work.
-
-### 10.12 Verify end to end
-
-```bash
-go install ./cmd/kubectl-ate
-
-kubectl ate create actor my-counter-1 --template ate-demo/counter
-kubectl ate get actors -A
-
-# snapshot actually landed on the Spark
-aws --endpoint-url http://10.0.2.160:9000 s3 ls s3://ate-snapshots/ate-demo-counter/ --recursive
-
-# exercise it
-kubectl port-forward -n ate-system svc/atenet-router 8000:80 &
-curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" -i http://localhost:8000/
-
-# suspend / resume round trip — this is the real test
-kubectl ate suspend actor my-counter-1 -a ate-demo
-kubectl ate resume  actor my-counter-1 -a ate-demo
-curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" -i http://localhost:8000/
-```
-
-The counter must keep its value across suspend/resume. If it does, RAM snapshotting to the Spark works. Then suspend, cordon the node it was on, and resume — it should come back on a *different* FW2B. That proves cross-node restore, which is the whole point.
-
-### 10.13 Expect this to be slow, and why
-
-Snapshots are **RAM images** moving over 1GbE at roughly 110 MB/s. A 512 MB actor is ~5 seconds each way. Upstream's "sub-second activation" assumes cloud networking and local SSD; you will not see it. Moving RustFS onto the NUC wouldn't help either — the FW2B's single 1GbE NIC is the bottleneck regardless of where the store sits.
-
-**The one real mitigation you already own:** each FW2B has a second, unused i211. PXE happens on `eth0` before the machine config applies, so bringing up the second NIC afterwards costs you nothing in §5 and doesn't affect `${mac}` determinism. Add to `patches/worker.yaml`:
-
-```yaml
----
-apiVersion: v1alpha1
-kind: DHCPv4Config
-name: <second interface name>     # confirm with: talosctl -n <ip> get links
-```
-
-Then give the Spark an address on that segment and point `AWS_ENDPOINT_URL` at it. Worth doing only after you've measured the default path and confirmed the network is actually the limit.
-
-### 10.14 What to watch
-
-1. **Never add the NUC to a WorkerPool.** §2. This is the failure that will look like a Substrate bug and isn't.
-2. **`gs://` in `snapshotsConfig.location` is correct with an S3 backend.** §10.7.
-3. **Snapshots are the only copy of actor state.** RustFS is beta, single-node, on one box. Back `/srv/rustfs/data` up, or accept that a Spark disk failure loses every actor.
-4. **Talos upgrades reset worker sysctls** only if you forget to re-serve `worker.yaml`. The §8.1 upgrade flow refreshes assets but not the config Secret — re-run the §10.3 secret refresh whenever `patches/worker.yaml` changes.
-5. **`user.max_user_namespaces` weakens KSPP hardening** on the workers. §4.3.
-6. **Pin every image by digest in ActorTemplates.** Changing an image invalidates snapshots, and upstream requires digest pinning for exactly this reason.
 ---
 
 ## Sources
@@ -1676,6 +1202,8 @@ Then give the Spark an address on that segment and point `AWS_ENDPOINT_URL` at i
 - [Celeron J3060 — WikiChip](https://en.wikichip.org/wiki/intel/celeron/j3060)
 - [Agent Substrate](https://github.com/agent-substrate/substrate)
 - [Substrate API guide (WorkerPool / ActorTemplate / SandboxConfig)](https://github.com/agent-substrate/substrate/blob/main/docs/api-guide.md)
+- [Substrate operator install (`ate-setup`, `SubstrateInstall`)](https://github.com/agent-substrate/substrate/blob/main/docs/operator-install.md)
+- [Substrate database configuration (BYO PostgreSQL)](https://github.com/agent-substrate/substrate/blob/main/docs/postgres.md)
 - [Substrate kind cluster config — required feature gates](https://github.com/agent-substrate/substrate/blob/main/hack/create-kind-cluster.sh)
 - [Substrate atelet S3 wiring (kind overlay)](https://github.com/agent-substrate/substrate/blob/main/manifests/ate-install/kind/atelet/kustomization.yaml)
 - [Substrate RustFS manifest](https://github.com/agent-substrate/substrate/blob/main/manifests/ate-install/kind/rustfs.yaml)

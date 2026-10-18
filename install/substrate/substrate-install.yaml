@@ -1,0 +1,48 @@
+# ate-setup configuration for the homelab. See README.md, Phase 4, and
+# upstream's docs/operator-install.md for every key.
+#
+#   go run ./cmd/ate-setup deploy ate-system --config <this file>
+#
+# Secrets are never written here. Export these before each run:
+#   ATE_API_POSTGRES_OWNER_CONNECTION_STRING
+#   ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING
+# (see README.md, Phase 4, for their exact shape).
+apiVersion: install.ate.dev/v1alpha1
+kind: SubstrateInstall
+
+namespace: ate-system
+
+# Pins the Substrate control plane to cp-00, which carries the
+# ate.dev/workloadType=ate-control-plane label from Talos nodeLabels.
+cordonControlPlane: true
+
+# The router is ClusterIP-only and reached through kubectl port-forward.
+# Follow-up: static-mtls once an in-cluster caller exists.
+ingressAuthMode: deprecated-insecure
+
+atenet:
+  dataplane: envoy
+  egress:
+    # Bundled Kubernetes Secrets provider, default-deny until an atespace is
+    # granted namespaces.
+    credentialProvider: '{"name":"k8s.io"}'
+
+ko:
+  dockerRepo: 10.0.2.160:5000/substrate
+  # The workstation is arm64; every Node is amd64.
+  defaultPlatforms: linux/amd64
+
+storage:
+  bucketName: ate-snapshots
+
+ateapi:
+  authz:
+    # Bootstrap owner stays at the ate-client ServiceAccount default.
+    # Follow-up: set bootstrapOwners to real principals.
+    enabled: true
+  postgres:
+    schema: substrate
+    # Relative to the substrate checkout ate-setup runs from; Phase 3 copies
+    # the CA certificate there. ate-setup publishes it as a Secret that
+    # ate-api-server mounts at /run/postgres-server-ca/server-ca.pem.
+    serverCAFile: spark-ca.crt

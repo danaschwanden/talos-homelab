@@ -1,0 +1,104 @@
+# Homelab differences from upstream's GKE-shaped manifests/ate-install/base.
+#
+# ate-setup always renders base outside kind mode and has no flag for extra
+# components, so this is added to the checkout's base before every run:
+#
+#   install/substrate/add-homelab-component.sh <substrate-checkout>
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  # Snapshots and private sandbox assets go to RustFS on the Spark, not GCS.
+  # Mirrors upstream's kind overlay (manifests/ate-install/kind/atelet), with
+  # the credentials read from a Secret instead of inlined.
+  - patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: atelet
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            initContainers:
+            - name: objectstore-plugin
+              env:
+              - name: ATE_STORAGE_BACKEND
+                value: s3
+              - name: AWS_REGION
+                value: us-east-1
+              - name: AWS_ENDPOINT_URL
+                value: http://10.0.2.160:9000
+              - name: AWS_S3_USE_PATH_STYLE
+                value: "true"
+              - name: AWS_ACCESS_KEY_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: rustfs-credentials
+                    key: AWS_ACCESS_KEY_ID
+              - name: AWS_SECRET_ACCESS_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: rustfs-credentials
+                    key: AWS_SECRET_ACCESS_KEY
+
+  # base wires atelet to the node's kubelet image credential provider through
+  # GKE host paths (/home/kubernetes/bin, /etc/srv/kubernetes), which Talos's
+  # read-only root can't create. Images come from the Spark registry and
+  # public registries, so drop the provider, as upstream's kind overlay does.
+  #
+  # args is replaced wholesale (a strategic-merge list): this is base's list
+  # minus the two --image-credential-provider-* flags. Re-sync it with
+  # manifests/ate-install/atelet.yaml when pulling main.
+  - patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: atelet
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            containers:
+            - name: atelet
+              args:
+              - --grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+              - --client-ca-certs=/run/podidentity.podcert.ate.dev/trust-bundle.pem
+              - --ateapi-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem
+              - --drain-delay=0s
+              - --drain-timeout=5m
+              - --objectstore-plugin-socket=/run/objectstore-plugin/node.sock
+              volumeMounts:
+              - mountPath: /run/image-credential-provider/bin
+                $patch: delete
+              - mountPath: /run/image-credential-provider/config.yaml
+                $patch: delete
+            volumes:
+            - name: image-credential-provider-bin
+              $patch: delete
+            - name: image-credential-provider-config
+              $patch: delete
+
+  # Google Managed Prometheus scrape config; its CRD exists only on GKE, and
+  # ate-setup's system apply fails on an unknown kind.
+  - patch: |-
+      $patch: delete
+      apiVersion: monitoring.googleapis.com/v1
+      kind: PodMonitoring
+      metadata:
+        name: atenet-router-envoy
+        namespace: ate-system
+
+  # base points every component at GKE-managed OTel, which doesn't exist here.
+  # Turn OTLP export off; Prometheus /metrics and stdout logs still work.
+  # Follow-up: deploy a collector and drop this patch.
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ate-otel-config
+        namespace: ate-system
+      data:
+        OTEL_TRACES_EXPORTER: none
+        OTEL_METRICS_EXPORTER: none
+        OTEL_LOGS_EXPORTER: console

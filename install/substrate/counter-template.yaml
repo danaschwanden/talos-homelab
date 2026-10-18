@@ -1,0 +1,40 @@
+# Smoke-test ActorTemplate: upstream's counter demo (demos/counter) in the
+# homelab atespace. ActorTemplates are not Kubernetes objects; this is the
+# protojson form of ateapipb.ActorTemplate, created through the ate API:
+#
+#   hack/run-tool.sh ko resolve -f <this file> | kubectl ate create actor-template -f -
+#   (from the substrate checkout)
+metadata:
+  atespace: homelab
+  name: counter
+workerSelector:
+  matchLabels:
+    workload: homelab
+containers:
+- name: counter
+  image: ko://go.ate.dev/substrate/demos/counter
+  command:
+  - /ko-app/counter
+  wakeupProbe:
+    httpGet:
+      path: /readyz
+      port: 80
+  volumeMounts:
+  - name: data
+    mountPath: /home/counter
+# Sandbox size; must fit within the Worker's limits (workerpool-fw2b.yaml).
+resources:
+  limits:
+  - name: cpu
+    quantity: "1"
+  - name: memory
+    quantity: 512Mi
+snapshotConfig:
+  # Captures process memory, so the in-memory count survives suspend/resume.
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
+  # gs:// on purpose: the scheme is only a location string. atelet's storage
+  # backend (S3, via the homelab component) decides where it actually goes.
+  storageLocation: gs://ate-snapshots/homelab/counter/
+volumes:
+- name: data
+  durableDir: {}

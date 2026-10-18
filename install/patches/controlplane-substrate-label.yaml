@@ -1,0 +1,5 @@
+# Agent Substrate: with cordonControlPlane: true, ate-setup pins the Substrate
+# control plane to Nodes carrying this label. Only cp-00 gets it.
+machine:
+  nodeLabels:
+    ate.dev/workloadType: ate-control-plane

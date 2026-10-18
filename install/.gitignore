@@ -5,3 +5,8 @@ controlplane.yaml
 worker.yaml
 kubeconfig
 *.db
+
+# Agent Substrate: Spark-side secrets and issue-certs.sh scratch output.
+substrate/spark/postgres-password
+substrate/spark/rustfs.env
+substrate/spark/out/

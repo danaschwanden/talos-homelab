@@ -8,7 +8,7 @@ the section numbers in that document — read it first; this tree is not self-ex
     wn-02   Protectli FW2B   10.0.2.152   worker
     wn-03   Protectli FW2B   10.0.2.153   worker
     wn-04   Protectli FW2B   10.0.2.154   worker
-    --      NVIDIA DGX Spark 10.0.2.160   RustFS + registry (NOT a cluster node, §10)
+    --      NVIDIA DGX Spark 10.0.2.160   PostgreSQL + RustFS + registry (NOT a cluster node, §10)
 
     gateway 10.0.2.1     subnet 10.0.2.0/24
 
@@ -19,9 +19,10 @@ the section numbers in that document — read it first; this tree is not self-ex
 | `schematic.yaml` | §4.1 | Image Factory schematic. Optional — skip for the vanilla schematic ID. |
 | `patches/controlplane.yaml` | §4.2 | Verify `install.disk` at step B3 before use. |
 | `patches/worker.yaml` | §4.3 | Deliberately has **no** `machine.install` — that's what keeps netboot working. |
-| `patches/registry-mirror.yaml` | §10.4 | §10 only. Append to both generated configs. |
+| `patches/controlplane-substrate-label.yaml` | §10 | §10 only. Patch into `controlplane.yaml`. |
+| `patches/trusted-roots.yaml` | §10 | §10 only. Generated on the Spark; append to both generated configs. |
 | `k8s/*.yaml` | §4.4–§4.10 | Apply `00-namespace.yaml` first and on its own. |
-| `substrate/*` | §10.7–§10.11 | §10 only. `kustomization.yaml` goes into a substrate checkout. |
+| `substrate/*` | §10 | §10 only. Self-contained runbook: [`substrate/README.md`](substrate/README.md). |
 
 ## Before you apply anything
 

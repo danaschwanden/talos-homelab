@@ -1,0 +1,88 @@
+# Substrate's state store, snapshot store and image registry on the Spark.
+# See ../README.md, Phase 1, and docs/adr/0001-substrate-state-on-the-spark.md.
+#
+#   sudo docker compose -f compose.yaml up -d
+#
+# Secrets live next to this file and are never committed:
+#   postgres-password   superuser password for the `postgres` role
+#   rustfs.env          RUSTFS_ACCESS_KEY=… / RUSTFS_SECRET_KEY=…
+# Certificates come from issue-certs.sh (/srv/substrate/certs).
+
+name: substrate
+
+services:
+  postgres:
+    # Same image upstream's bundled database pins (manifests/ate-install/postgres).
+    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    restart: unless-stopped
+    ports:
+      - "10.0.2.160:5432:5432"
+    environment:
+      POSTGRES_DB: substrate
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+    secrets:
+      - postgres-password
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/postgres.crt
+      - -c
+      - ssl_key_file=/certs/postgres.key
+      - -c
+      - ssl_min_protocol_version=TLSv1.3
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    volumes:
+      - ate-postgres-data:/var/lib/postgresql
+      - /srv/substrate/certs/postgres.crt:/certs/postgres.crt:ro
+      - /srv/substrate/certs/postgres.key:/certs/postgres.key:ro
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "substrate"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rustfs:
+    # Same image upstream's kind overlay pins (manifests/ate-install/kind/rustfs.yaml).
+    image: rustfs/rustfs:1.0.0-beta.3@sha256:378642b05b7dcb4849fb77ebe6aca4ced1c3f66e7e504247df95a5c9018d3358
+    restart: unless-stopped
+    ports:
+      - "10.0.2.160:9000:9000"
+      - "10.0.2.160:9001:9001"
+    env_file: rustfs.env
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: error
+    volumes:
+      - rustfs-data:/data
+
+  registry:
+    image: registry:3
+    restart: unless-stopped
+    ports:
+      - "10.0.2.160:5000:5000"
+    environment:
+      REGISTRY_HTTP_TLS_CERTIFICATE: /certs/registry.crt
+      REGISTRY_HTTP_TLS_KEY: /certs/registry.key
+    volumes:
+      - registry-data:/var/lib/registry
+      - /srv/substrate/certs/registry.crt:/certs/registry.crt:ro
+      - /srv/substrate/certs/registry.key:/certs/registry.key:ro
+
+secrets:
+  postgres-password:
+    file: ./postgres-password
+
+# Back these up together with /srv/spark-ca (README §9, item 7).
+volumes:
+  ate-postgres-data:
+  rustfs-data:
+  registry-data:
